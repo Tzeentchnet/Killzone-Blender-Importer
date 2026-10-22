@@ -1,0 +1,26 @@
+schema_version = "1.0.0"
+
+id = "io_scene_killzone"
+version = "0.13.0"
+name = "Killzone Asset Tools"
+tagline = "Import maps, models, textures, and animation Actions"
+maintainer = "Killzone Blender contributors"
+type = "add-on"
+tags = ["Import-Export"]
+
+blender_version_min = "5.2.0"
+blender_version_max = "5.3.0"
+
+license = [
+  "SPDX:GPL-3.0-or-later",
+]
+
+[permissions]
+files = "Read Killzone ISOs/DATs and exchange local asset bundles"
+
+[build]
+paths_exclude_pattern = [
+  "__pycache__/",
+  "/.git/",
+  "/*.zip",
+]

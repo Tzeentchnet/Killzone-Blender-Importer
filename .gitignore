@@ -1,0 +1,20 @@
+# User-provided game data and probe output
+*.iso
+FILES.DAT
+FILES01.DAT
+FILES02.DAT
+FILES03.DAT
+FILES04.DAT
+probe-output/
+
+# Generated packages and Python caches
+dist/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+*.py[cod]
+*.blend
+*.blend1
