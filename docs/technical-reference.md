@@ -37,13 +37,18 @@ from game-format parsers.
   parsing; exact `INDEX_4`, `INDEX_8`, `ALPHA_4`, and `ALPHA_8` indexed
   decoding; packed `RGBA_8888` and `RGB_888`; and explicit unresolved nodes
   for dynamic GLOW palettes and invalid resources.
-- Purpose-built preview scenes add a labeled decoded-color diagnostic after
-  exact `WRITE` and bounded V4-8 `ALPHAADD` admission fail; normal imports
-  retain the evidence-gated disconnected behavior.
+- Map and model imports connect labeled `WRITE`, bounded V4-8
+  `ALPHAADD`, `ALPHAADD + LAYERBUMPDOT3`, and diagnostic
+  `MASKEDWRITE + ALPHAADD` previews when their strict gates pass. Other
+  selected providers may use a labeled decoded-color diagnostic; unresolved
+  composition remains explicit.
 - Corpus-verified DMA/VIF decoding of 9,327 regular static resources and
   164,630 packets across all 18 packet-tail shapes, including signed
   positions, packed normals/ADC, UV0/UV1, V4-8 vertex data, and preserved
   terminal auxiliary bytes.
+- Host-corrected static and skinned UV import preserves direct UV layers and
+  authored repeat-tile offsets, with a bounded axis-aligned subset of the
+  serialized six-float material transform.
 - Independently reproduced format evidence for generic Core typed sections,
   object-owned CoreStream ranges, material references, 29,680 skinned DMA/VIF
   packets, exact skinned quantization, direct selector-to-bone lookup, packed
@@ -66,8 +71,9 @@ from game-format parsers.
   state for one attribution-bounded three-pass material family.
 - Corpus-verified decoding of 9,327 regular static resources and 164,630
   packets across all 47 level Cores, including all 18 packet-tail shapes.
-- A verified level render-resource graph with 2,738 identity-placed direct
-  world roots in addition to ordinary `StaticMeshInstance` draws.
+- A verified level render-resource graph with ordinary static instances,
+  11,970 collision-backed visual instances, and 753 remaining
+  identity-placed direct-world roots.
 - Headless tests against Blender 5.2.
 
 The bundle coordinate convention is right-handed, Z-up, -Y-forward, in meters.
@@ -106,18 +112,19 @@ vertices are runtime state rather than serialized level objects. Native level
 imports therefore do not fabricate projected decals. Static card-like meshes
 in a level import are not evidence of the runtime decal system.
 Exact static VU processing, native coordinate and front-face conventions,
-generated coordinate equations, optional serialized transform multiplication,
-full material composition beyond the bounded runtime capture, the artistic
-source of dynamic GLOW palettes, the semantic role of serialized temporary
-transforms, collision relationships, and general edited-object serialization
-remain unresolved. The standalone skinned importer treats the temporary
-transforms as row-vector global inverse-bind matrices, transposes and inverts
-them for a candidate Blender rest pose, and records that interpretation on the
-armature; this is a diagnostic conversion rather than a claim about the final
-runtime bind equation. The static importer uses diagnostic object colors and a
-normal-guided winding correction. Proven direct UV routes are linked to
-inspection nodes, but native texture layers remain disconnected from final
-shader output; this does not claim reconstructed final game materials or a
+generated coordinate equations, rotated or sheared optional-transform
+multiplication, full material composition beyond the bounded policies, the
+artistic source of dynamic GLOW palettes, the semantic role of serialized
+temporary transforms, collision relationships, and general edited-object
+serialization remain unresolved. The standalone skinned importer treats the
+temporary transforms as row-vector global inverse-bind matrices, transposes
+and inverts them for a candidate Blender rest pose, and records that
+interpretation on the armature; this is a diagnostic conversion rather than a
+claim about the final runtime bind equation. The static importer uses
+diagnostic object colors and a normal-guided winding correction. Proven direct
+UV routes and narrowly admitted material families can drive visible preview
+output, but every preview retains its exact, bounded, artist-approximation, or
+unresolved status. This does not claim reconstructed final game materials or a
 proven front-face convention. This add-on does **not** invent missing
 conversions, animation data, or native encoders.
 
@@ -442,11 +449,17 @@ generated environment coordinates, 9/10 select generated reflection
 coordinates, and 11 carries a serialized 4x4 matrix. Large UV0 ranges paired
 with captured repeat/repeat state prove intentional tiling.
 
-Direct STQ does not negate V. With decoded row zero represented at the top,
-source V points down, so Blender flips decoded image rows once and does not
-also flip UVs. Standard normalized host sampling requires no extra half-texel
-bias. The optional six-float transform packing is preserved, but its
-multiplication convention remains unresolved.
+Direct STQ retains source V. Core decoders preserve those source-space values,
+including authored repeat-tile offsets. Source row zero is at the top and V
+points down, while Blender mesh UV V points up. Blender image creation reverses
+decoded source rows into Blender's bottom-up pixel storage, and Blender mesh
+creation converts each direct coordinate with `(u, 1-v)`. No modulo
+normalization or extra half-texel bias is applied. A bounded axis-aligned
+subset of the optional six-float transform uses the serialized row-vector
+layout `(m00, m01, m10, m11, tx, ty)`. With cross terms effectively zero,
+Blender applies source-space `u' = m00*u + tx` and `v' = m11*v + ty`, converted
+to host V-up coordinates before wrap policy. Rotated or sheared six-float
+transforms remain preserved and unconnected.
 
 V4-8 is unsigned vertex diffuse RGBA rather than unconditional final prelight.
 The `LIGHT_CUBIC_DIFFUSE` VU path builds a light term from the squared normal
@@ -692,9 +705,13 @@ roots during the cached asset scan. In **KZ Tools > Import Model**, a skinned
 root imports its selected LOD0 leaves, source-order Skeleton, rigid vertex
 groups, native Materials, and packed images. Cache schema 2 records each
 bank's lightweight clip identity and duration, allowing a multi-select clip
-list without decoding payloads during UI changes. Model-Core clips and one
-optional shared bank are selected by default, with **All** and **None**
-controls.
+list without decoding payloads during UI changes. Model-Core clips and, when a
+shared bank is chosen, that bank's clips are selected by default, with
+**All** and **None** controls. **Search Banks...** filters all 352 cached
+banks by exact `.core` filename or friendly label. A likely third-person
+character with no model-Core clips shows a bounded hint to try
+`allweapons.default.core`; vehicle and turret paths are excluded from that
+heuristic.
 
 A clip is admitted only when its binding covers every source Skeleton bone.
 Extra unmatched bank tracks are preserved in Action metadata. The optimized
@@ -702,8 +719,9 @@ writer constructs layered FCurves directly with vectorized coordinates and
 linear interpolation, reducing exactly constant channels to one key. The
 original per-bone `keyframe_insert` writer remains visible and is the automatic
 fallback for optimized Blender-writing failures. Decode and decomposition
-failures do not fall back. The visible decomposition tolerance defaults to
-`0.05`.
+failures do not fall back. Writer selection, fallback policy, and the
+decomposition tolerance are persistent add-on preferences; the tolerance
+defaults to `0.05`.
 
 Standalone static roots use the same Multi expansion, LOD0 selection, packet
 decoder, material construction, and packed-image path without creating an
@@ -823,7 +841,15 @@ Action. Curves are baked at the requested rate, mapped through the scene frame
 rate, and made linear; VU0 interpolation is exact at baked samples rather than
 between sparse host keys. Repeat and held one-shot policy, clip/event identity,
 root policy, basis, digests, and decoder status are retained as Action
-metadata.
+metadata. A one-clip library receives a semantic Action name only when its
+serialized `skelet_<name>` Skeleton identity agrees with the uniquely bound
+`<name>_joint` root track. This names the heavy-hovertank clip
+`Collapsing_tank` without assigning a shared root-bone name to all clips in a
+multi-clip bank. Otherwise the source path, token, and directory key remain
+the Action title. The requested and final names, rule provenance, and former
+coded title are retained in `killzone_action_name_requested`,
+`killzone_action_name`, `killzone_action_name_source`, and
+`killzone_legacy_action_name`.
 
 ### Native Texture import
 
@@ -833,20 +859,14 @@ RGBA palette plus preserved auxiliary bytes, and a preserved 120-byte footer.
 Standard PS2 PSMT8 unswizzling and CSM1 palette remapping were validated across
 all 19 authorized-disc samples.
 
-To import one in Blender:
-
-1. In the add-on preferences, choose the authorized ISO or a directory
-   containing `FILES.DAT` and `FILES01-04.DAT`.
-2. Select **Scan / Rescan Importable Assets**.
-3. Open **3D View > Sidebar > KZ Tools**.
-4. Under **Import Texture**, select a cached entry and choose
-   **Import Texture**.
-
-The result is a persistent Blender Image with its archive path, source Core
-SHA-256, decoded RGBA SHA-256, and encoding recorded as custom properties.
-The original Core bytes and unknown regions remain authoritative. Edited-image
-native export is deliberately unavailable until an encoder and game-side
-round-trip are proven.
+The standalone decoder produces a persistent Blender Image with its archive
+path, source Core SHA-256, decoded RGBA SHA-256, and encoding recorded as
+custom properties. The dedicated sidebar selector is not exposed because the
+retail standalone set consists of menu/loading images; map and model imports
+create their referenced images automatically. The original Core bytes and
+unknown regions remain authoritative. Edited-image native export is
+deliberately unavailable until an encoder and game-side round-trip are
+proven.
 
 #### Embedded textures and level materials
 
@@ -896,21 +916,39 @@ creating any opaque/procedural providers. All 85 AnimatedTextures and their
 
 Blender receives native per-face material assignments and one node per
 serialized layer. Normal and complementary decoded images are attached where
-available. Proven selectors 0-7 are linked to direct native UV maps when no
-unresolved optional transform applies; generated environment/reflection
-routes, selector-11 matrices, and six-float transforms remain explicitly
-unconnected. Normal imports connect only bounded single-layer, direct-UV
-indexed `ALPHAADD` cases when every user mesh carries Native V4-8 color.
-`INDEX_4` retains its target-validated gate; `INDEX_8` additionally requires
-the exact matching serialized render state described above. Texture and
-vertex RGBA are modulated at the PS2 `128 == 1.0` scale and operation 5 is
-represented as source-over transparency. Other Texture layers remain
-disconnected because full VU source color, lighting, layer composition, and
-runtime mutation are not reconstructed. Generated preview scenes additionally
-connect a bounded layer-0 `WRITE` diagnostic and save the 3D viewport in
-Material Preview camera mode. A small emission boost keeps dark source
-textures legible without claiming native lighting. Blue warnings identify
-these previews as diagnostic rather than exact game material shading.
+available. Proven selectors 0-7 are linked to host-corrected direct native UV
+maps when no unresolved optional transform applies. Axis-aligned six-float
+scale/offset transforms use a bounded Mapping node; generated
+environment/reflection routes, selector-11 matrices, and transforms with
+rotation or shear remain explicitly unconnected. Regular imports connect
+bounded single-layer, direct-UV indexed
+`ALPHAADD` cases when every user mesh carries Native V4-8 color. `INDEX_4`
+retains its target-validated gate; `INDEX_8` additionally requires the exact
+matching serialized render state described above. Texture and vertex RGBA
+are modulated at the PS2 `128 == 1.0` scale and operation 5 is represented as
+source-over transparency.
+
+A second narrow policy admits the two-layer HQ Grounds family:
+indexed `ALPHAADD` on repeated UV0 followed by `ALPHA_8`
+`LAYERBUMPDOT3` on clamped UV1. The latter is not a normal map. Its alpha
+uses the packets' uniform Native V4-8 alpha 127. The color-stream VU
+continuation truncates `127 / 2` to fragment alpha 63; the constant-alpha-64
+no-color fragment is not this packet shape. GS HIGHLIGHT saturation and blend
+policy `0x89` then give:
+
+```text
+sourceAlphaByte = min(detailAlphaByte + 63, 255)
+previewRGB = layer0RGB * sourceAlphaByte / 128
+```
+
+Map and model imports also connect a bounded layer-0 `WRITE` preview,
+the narrowly admitted HQ Grounds two-layer multiplier, the
+same-texture `MASKEDWRITE + ALPHAADD` foliage cutout, and structurally
+selected decoded-color diagnostics. A small emission boost keeps dark
+diagnostic textures legible without claiming native lighting. Other layers
+remain unconnected when full VU source color, lighting, layer composition, or
+runtime mutation is not reconstructed. Blue warnings identify unresolved
+fallback output rather than a hidden blue source texture.
 
 ### Runtime decal evidence
 
@@ -972,8 +1010,10 @@ effects, entities, and other gameplay objects. A native level is therefore a
 compound Core object graph, not a geometry-only file.
 
 `StaticMeshInstance` is not the owner or enumerator of all visible geometry.
-Build a directed graph of regular, Multi, and LOD static resources using
-wrapper-child references. Across the 47 level Cores:
+`CollisionMeshInstance.General.MeshResource` supplies another authored visual
+occurrence path, and resources targeted by neither class can be direct world
+geometry. Build a directed graph of regular, Multi, and LOD static resources
+using wrapper-child references. Across the 47 level Cores:
 
 | Measure | Count |
 |---|---:|
@@ -982,32 +1022,40 @@ wrapper-child references. Across the 47 level Cores:
 | LOD-static wrappers | 2,793 |
 | Resource roots | 5,896 |
 | Roots referenced by static instances | 3,158 |
-| Direct world roots with no instance reference | 2,738 |
+| Roots referenced by collision-mesh instances | 1,985 |
+| Direct world roots with no visual-instance reference | 753 |
 
-Import every non-null instance reference by recursively expanding all Multi
-children, selecting LOD child zero, and applying the instance matrix. Then
-import each graph root not named by an instance using the same expansion at
-identity. Direct regular leaves already contain level/world coordinates.
+Import every non-null static-instance reference and every
+`CollisionMeshInstance` visual-mesh reference by recursively expanding all
+Multi children, selecting LOD child zero, and applying the authored matrix.
+Then import each graph root targeted by neither class using the same expansion
+at identity. Direct regular leaves already contain level/world coordinates.
 Do not independently import every regular leaf: that duplicates wrapper
-children and alternate LODs. Two legal Mall and Docks1 instances reference
-wrapper children rather than roots and must still be processed.
+children and alternate LODs. Two static targets and three collision-mesh
+targets are legal wrapper children rather than roots and must still be
+processed. No visual resource is targeted by both occurrence classes in the
+retail corpus.
 
 Default LOD0 expansion produces:
 
 | Render path | Leaf occurrences | Packet occurrences | Triangle occurrences |
 |---|---:|---:|---:|
-| Direct world roots | 2,924 | 91,812 | 2,576,133 |
+| Direct world roots | 813 | 9,975 | 291,081 |
 | Static instances | 22,109 | 91,913 | 2,326,919 |
+| Collision-mesh instances | 15,928 | 236,641 | 7,259,592 |
 
 These are draw occurrences rather than physical storage totals because
 instances repeat resources and unselected LOD children remain stored.
-Street2 specifically contains 72,276 direct-world and 60,477 instanced
-triangles. An importer starting only from `StaticMeshInstance` can therefore
-appear to import decals and props while dropping most of the level.
+Street2 specifically contains 3,561 direct-world, 60,477 static-instance, and
+116,298 collision-mesh-instance triangle occurrences. An importer starting
+only from `StaticMeshInstance` can therefore appear to import decals and props
+while still omitting most collision-backed visual geometry.
 
-SDDocking resources `0x061005A8` and `0x0615026C` are direct world roots and
-are unreachable from any `StaticMeshInstance`; their appearance in the GS
-trace independently validates identity-placed direct-root rendering.
+SDDocking resources `0x061005A8` and `0x0615026C` were previously classified
+as direct world roots because they are unreachable from any
+`StaticMeshInstance`. Follow-up analysis found that both are instead
+referenced by `CollisionMeshInstance`. Their appearance in the GS trace
+validates collision-backed visual submission, not direct-root rendering.
 
 To import the implemented static render graph in Blender:
 
@@ -1024,13 +1072,23 @@ Texture, AnimatedTexture, and Material decoding and imports geometry with the
 diagnostic fallback material.
 
 The importer creates **Direct World (identity)** and **Props** collections.
-**Props** contains **Static Instances** plus **Animated Skinned Instances
-(metadata only)**. A `StaticMeshInstance` that selects one regular leaf is a
-transformed mesh object keyed by its compact-directory identity. Null-resource
-instances and occurrences that expand to multiple Multi children use an owner
-Empty; selected leaves are identity-local children so the source placement
-matrix is applied exactly once. Repeated occurrences remain distinct objects
-while sharing one mesh datablock per exact regular-resource directory object.
+**Props** contains **Static Instances**, **Collision Mesh Instances**, and
+**Animated Skinned Instances (metadata only)**. A static or collision-mesh
+occurrence that selects one regular leaf is a transformed mesh object keyed by
+its compact-directory identity. Null static instances and occurrences that
+expand to multiple Multi children use an owner Empty; selected leaves are
+identity-local children so the source placement matrix is applied exactly
+once. Repeated occurrences remain distinct objects while sharing one mesh
+datablock per exact regular-resource directory object.
+The map root collection records the import product/operator, add-on version,
+serialized static- and collision-mesh-instance counts, selected
+leaf-occurrence counts, distinct matrix counts, origin counts, Blender owner
+counts, and unique leaf-mesh count. Collision occurrences also retain the
+collision group, enabled state, collision resource token/type/directory key,
+visual mesh token/key, footer, and source matrix. This metadata does not imply
+that collision geometry has been decoded. Standalone static-model roots are
+explicitly marked as definition previews with
+`killzone_level_placement_context_loaded = false`.
 
 `SimpleAnimatingSkinnedMeshInstance` records are preserved as owner Empties
 because the level-instance graph is not yet connected to the standalone
@@ -1045,16 +1103,26 @@ occurrences.
 
 Each static mesh can contain `Native UV0`, `Native UV1`, `Native V4-8`,
 `killzone_adc`, and `killzone_material_id` data when present in the source.
-Native Materials are assigned per face, and exactly decoded selected textures
-become persistent packed Blender Images referenced by inspection nodes with
-proven direct UV links. Packing is required so decoded pixel buffers survive
-saving and reopening a `.blend`.
+The `Native UV*` Blender layers contain `(u, 1-v)` host coordinates while the
+core parser retains the original source values. Native Materials are assigned
+per face, and exactly decoded selected textures become persistent packed
+Blender Images referenced by inspection nodes with proven direct UV links.
+Packing is required so decoded pixel buffers survive saving and reopening a
+`.blend`.
 When **Import Map Textures** is enabled, the regular importer connects bounded
 single-layer direct-UV `WRITE` previews, exact indexed `ALPHAADD` cases with
-matching state and Native V4-8 data, and clearly labeled decoded-color
+matching state and Native V4-8 data, the narrowly admitted HQ Grounds
+two-layer `ALPHAADD` + `LAYERBUMPDOT3` family, the diagnostic same-texture
+`MASKEDWRITE` + `ALPHAADD` foliage cutout, and clearly labeled decoded-color
 diagnostics for structurally selected layers. Complex final shaders outside
-those policies remain diagnostic and unconnected rather than inventing native
-multi-pass composition.
+those policies remain diagnostic and unconnected rather than inventing
+native multi-pass composition.
+Connected previews use an unlit Emission surface, apply the native
+`alpha_reference >> 1` comparison for all eight alpha-test functions, and
+preprocess mixed repeat/clamp axes independently. Materials identify their
+profile as `bounded-native-preview`, `artist-approximation`, or `unresolved`
+and retain a JSON list of unimplemented native state. The same material path
+is used by static and standalone skinned meshes.
 For diagnostic `ALPHAADD` layers that fall outside exact GS-state admission
 but have serialized Native V4-8 data, the visible preview applies the measured
 `texture * V4-8 * (255 / 128)` color and alpha modulation while continuing to
@@ -1086,20 +1154,42 @@ root:
 survived as a packed Blender Image. It does not claim that the complete native
 material renders exactly. `diagnostic-write-preview` identifies purpose-built
 layer-0 `WRITE` previews, `diagnostic-color-preview` identifies a structurally
-selected decoded color layer, while
+selected decoded color layer, and
+`resolved-bounded-alphaadd-layerbumpdot3-composition` identifies both layers
+of the admitted HQ Grounds composition. That status retains explicit reasons
+for pre-layer-0 framebuffer history and GS byte quantization/final saturation.
+`diagnostic-maskedwrite-alphaadd-cutout-preview` identifies both preserved
+layers of the foliage approximation while recording that only decoded
+layer-0 color and strict decoded alpha `> 204` are connected.
+Meanwhile,
 `inspection-only-final-shader-unconnected` identifies layers preserved for
 inspection without reconstructed composition. The log separately groups
-generated-coordinate routes, unresolved six-float transform convention,
+generated-coordinate routes, unresolved rotated/sheared six-float transforms,
 runtime palette selection, animated first-frame previews, RGB888 host-only
 alpha, and missing UV data.
 
-The Mountainpass validation resolves all 299 selected textures with no missing
-providers: 231 `ALPHA_8`, 47 `INDEX_8`, 18 `INDEX_4`, two `RGBA_8888`, and one
-`RGB_888`. Its material diagnostic connects 276 of 277 selected Materials:
-256 layer-0 `WRITE` previews and 20 decoded-color diagnostics. One unrelated
-complex material remains unconnected rather than broadening admission beyond
-the four documented structural families. Exact bounded V4-8 `ALPHAADD`
-admission remains zero for this level.
+The prior Mountain Pass validation resolves all 299 selected textures with no
+missing providers: 231 `ALPHA_8`, 47 `INDEX_8`, 18 `INDEX_4`, two
+`RGBA_8888`, and one `RGB_888`. It connected 276 of 277 selected Materials:
+256 layer-0 `WRITE` previews and 20 decoded-color diagnostics. The structural
+`MASKEDWRITE` foliage cutout now admits the remaining family; a retail rerun
+is still required before recording a 277/277 fixture result. Exact bounded
+V4-8 `ALPHAADD` admission remains zero for this level.
+
+HQ Grounds Materials `0x0054515A` and `0x005450C0` are the admitted
+target pair. The same structural and V4-8-alpha gate also admits Materials
+`0x005452A4`, `0x005453AC`, and `0x0054D4EA`; it does not admit operation 18
+in general. The target pair's layer-0 providers are respectively 256x128 `INDEX_8`
+Texture `0x00545906` and 128x128 `INDEX_4` Texture `0x005459DE`; both use
+repeated UV0 `ALPHAADD`. Layer 1 shares clamped-UV1 256x256 `ALPHA_8`
+Texture `0x005458BE` and uses `LAYERBUMPDOT3` with HIGHLIGHT-preserving TFX
+policy 3. Both records carry Native V4-8 with alpha exactly 127. The preview
+applies the proved alpha-divide-by-two multiplier, applies V4-8 RGB to the
+lighting-mode-1 base preview, and never connects layer 1 to a Blender Normal
+socket. Prior framebuffer history before layer 0, complete native lighting,
+and exact GS byte behavior remain explicit host limitations. Material
+`0x0053C0AC` is a real null Texture-provider `WRITE` material and remains
+unresolved rather than borrowing one of these textures.
 
 Material `0x00FB0B4A` is the repeated foliage family. Both direct-UV0 layers
 use 256x256 `INDEX_8` Texture `0x00561068`: layer 0 is `LIGHTMAPCOLOR` with
@@ -1109,6 +1199,37 @@ two regular-static definitions appear in 411 instance occurrences and 6,576
 triangle occurrences. The diagnostic connects the decoded color and alpha
 once; it does not claim to reproduce the two native passes, their VU features,
 or lighting.
+
+Level 6 Approach vegetation also uses Material `0x0610B418`, a single
+direct-UV0 `INDEX_8` `WRITE` layer covered by the bounded layer-0 preview.
+Its companion Material `0x060C4C60` supplies the two-pass foliage family
+below; both use decoded image formats rather than an unsupported texture
+encoding.
+
+Material `0x060C4C60` is the second same-texture direct-UV0 foliage family.
+Layer 0 is `MASKEDWRITE` with Z-write and alpha `GREATER 204`; layer 1 is
+`ALPHAADD` without Z-write. It appears on 49 instances. The material path
+uses runtime AREF 102 and AFAIL KEEP, so failed layer-0 coverage writes neither
+framebuffer nor depth. The Blender graph quantizes decoded image alpha to a
+byte and applies strict `> 204`, then uses that binary mask over decoded
+layer-0 color. It preserves both layer records and labels the graph
+`artist-approximation`: the first pass's additive RGB/depth behavior, the
+second pass's low-alpha fringe, framebuffer-alpha preservation, per-pass
+TFX/VU state, and intermediate GS clamp remain uncomposed.
+
+Level 6 Approach water Material `0x060C35C8` also uses only decoded formats,
+but its four-layer composition remains unresolved:
+
+1. a 32-frame animated `INDEX_4`/`INDEX_8` `ALPHAADD` base;
+2. a 32-frame animated `ALPHA_4` `LIGHTMAPCOLOR` layer;
+3. an `RGB_888` `LIGHTMAPINTENSITY` layer using generated-reflection
+   selector 10; and
+4. an `INDEX_8` `MASKEDWRITE` layer using selector 10.
+
+Accurate playback requires native AnimatedTexture timing/loop behavior,
+generated reflection coordinates, and framebuffer composition. The current
+frame-zero and diagnostic-node representation therefore remains explicit;
+the blue fallback does not indicate a missing image decoder.
 
 Material `0x005436FE` is the direct-world sandbag/rockwork family. Its
 single direct-UV0 `ALPHAADD` layer uses fully opaque 256x256 `INDEX_8` Texture
@@ -1120,15 +1241,16 @@ Street2 V4-8 source-over preview.
 `Direct 0001 0x00566D60` has four material records and 2,266 triangles. The
 diagnostic selects layer-0 decoded color from Materials `0x00564AF0`,
 `0x0054701E`, `0x00547702`, and `0x00546F22`, using UV0, UV0, UV2, and UV0
-respectively. The first layer's six-float transform convention remains
-unresolved, so its graph records that the transform was ignored instead of
-silently presenting the mapping as exact.
+respectively. The first layer carries rotation/shear cross terms, so its graph
+records that the transform was ignored instead of silently presenting the
+mapping as exact.
 
 This is a static render-graph importer, not a complete semantic level importer.
 Native material dependencies are assigned structurally, not rendered with
-their final game equations. Collision, skinned actors, paths, AI, entities,
-effects, lights, gameplay objects, higher LOD selection, and native export are
-not imported.
+their final game equations. Collision-mesh records now place their referenced
+visual resources, but their collision resources are metadata only. Collision
+geometry, skinned actors, paths, AI, entities, effects, lights, gameplay
+objects, higher LOD selection, and native export are not imported.
 
 ## Bundle layout
 
@@ -1164,8 +1286,8 @@ native milestones are:
 5. Capture live decal marks and receiver polygons/tags before connecting the
    proven projection, clipping, lifecycle, and ordinary Material submission
    path to Blender geometry.
-6. Add collision and other level semantics only after their resource
-   relationships and coordinate transforms are independently validated.
+6. Decode collision geometry and add other level semantics only after their
+   resource layouts and coordinate transforms are independently validated.
 7. Keep native export blocked until unchanged parse/serialize identity,
    edited-data encoding, archive repacking, and game-side acceptance are
    demonstrated.

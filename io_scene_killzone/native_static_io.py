@@ -18,6 +18,7 @@ from .native_level_io import (
     _object_matrix,
     create_native_materials,
     enable_bounded_native_material_previews,
+    set_native_import_provenance,
 )
 
 
@@ -46,6 +47,12 @@ def import_native_static_model_data(
     mesh_collection = bpy.data.collections.new("Static Meshes (LOD0)")
     context.scene.collection.children.link(root_collection)
     root_collection.children.link(mesh_collection)
+    set_native_import_provenance(
+        root_collection,
+        product="standalone-static-definition-preview",
+        operator="kz.import_model",
+        level_placement_context_loaded=False,
+    )
     root_collection["killzone_source_path"] = model_path
     root_collection["killzone_core_sha256"] = model.source_core_sha256
     root_collection["killzone_corestream_sha256"] = (
@@ -60,6 +67,10 @@ def import_native_static_model_data(
     root_collection["killzone_triangle_count"] = model.triangle_count
     root_collection["killzone_packet_shapes"] = str(model.packet_shapes)
     root_collection["killzone_lod_policy"] = "LOD child zero"
+    root_collection["killzone_definition_preview"] = True
+    root_collection["killzone_definition_occurrence_count"] = len(
+        model.render_plan.direct_occurrences
+    )
 
     selected_texture_tokens = (
         set(model.material_plan.direct_texture_tokens)
@@ -99,6 +110,10 @@ def import_native_static_model_data(
         obj["killzone_part_index"] = part_index
         obj["killzone_resource_token"] = f"0x{node.object_id:08X}"
         obj["killzone_model_kind"] = "static"
+        obj["killzone_occurrence_kind"] = (
+            "standalone-definition-preview"
+        )
+        obj["killzone_level_placement_context_loaded"] = False
         mesh_collection.objects.link(obj)
         mesh_objects.append(obj)
 
@@ -116,6 +131,7 @@ def import_native_static_model_data(
         preview_counts
     )
     root_collection["killzone_winding_corrections"] = winding_corrections
+    root_collection["killzone_unique_leaf_mesh_count"] = len(mesh_cache)
     return NativeStaticImportResult(
         model=model,
         root_collection=root_collection,

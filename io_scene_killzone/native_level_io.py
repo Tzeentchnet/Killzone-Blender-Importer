@@ -14,7 +14,9 @@ import struct
 import bpy
 from mathutils import Matrix, Vector
 
+from . import ADDON_VERSION
 from .core.native_level import (
+    NativeCollisionMeshInstance,
     NativeLevel,
     NativeObjectKey,
     NativeSimpleSkinnedInstance,
@@ -24,9 +26,16 @@ from .core.native_level import (
     load_native_level,
 )
 from .core.native_level_material import (
+    NATIVE_GS_COLOR_ONE,
+    NATIVE_LAYERBUMPDOT3_FRAGMENT_ALPHA,
+    NATIVE_LAYERBUMPDOT3_V4_8_ALPHA,
+    NATIVE_MASKEDWRITE_DECODED_ALPHA_CUTOFF,
     NativeAnimatedTexture,
     NativeLevelTexture,
     NativeMaterial,
+    native_alpha_reference_byte,
+    supports_bounded_native_layerbumpdot3_preview,
+    supports_diagnostic_native_maskedwrite_alphaadd_preview,
 )
 
 
@@ -37,9 +46,11 @@ class NativeLevelImportResult:
     direct_collection: bpy.types.Collection
     props_collection: bpy.types.Collection
     instance_collection: bpy.types.Collection
+    collision_instance_collection: bpy.types.Collection
     animated_instance_collection: bpy.types.Collection
     objects: tuple[bpy.types.Object, ...]
     static_instance_objects: tuple[bpy.types.Object, ...]
+    collision_instance_objects: tuple[bpy.types.Object, ...]
     animated_instance_objects: tuple[bpy.types.Object, ...]
     unique_mesh_count: int
     winding_corrections: int
@@ -49,7 +60,11 @@ class NativeLevelImportResult:
 
     @property
     def prop_objects(self) -> tuple[bpy.types.Object, ...]:
-        return self.static_instance_objects + self.animated_instance_objects
+        return (
+            self.static_instance_objects
+            + self.collision_instance_objects
+            + self.animated_instance_objects
+        )
 
 
 def _object_matrix(values: tuple[float, ...]) -> Matrix:
@@ -63,9 +78,36 @@ def _object_matrix(values: tuple[float, ...]) -> Matrix:
     ).transposed()
 
 
+def native_uv_to_blender(
+    coordinate: tuple[float, float],
+) -> tuple[float, float]:
+    return coordinate[0], 1.0 - coordinate[1]
+
+
+def set_native_import_provenance(
+    collection: bpy.types.Collection,
+    *,
+    product: str,
+    operator: str,
+    level_placement_context_loaded: bool,
+) -> None:
+    collection["killzone_addon_version"] = ".".join(
+        str(component) for component in ADDON_VERSION
+    )
+    collection["killzone_import_product"] = product
+    collection["killzone_import_operator"] = operator
+    collection["killzone_level_placement_context_loaded"] = (
+        level_placement_context_loaded
+    )
+
+
 def _set_instance_source_properties(
     obj: bpy.types.Object,
-    instance: NativeStaticInstance | NativeSimpleSkinnedInstance,
+    instance: (
+        NativeStaticInstance
+        | NativeCollisionMeshInstance
+        | NativeSimpleSkinnedInstance
+    ),
     *,
     serialized_type: str,
 ) -> None:
@@ -78,6 +120,9 @@ def _set_instance_source_properties(
     obj["killzone_object_id"] = f"0x{instance.object_id:08X}"
     obj["killzone_instance_section_offset"] = instance.key.section_offset
     obj["killzone_instance_object_index"] = instance.key.object_index
+    obj["killzone_instance_directory_key"] = (
+        f"{instance.key.section_offset:08X}:{instance.key.object_index}"
+    )
     obj["killzone_parent_token"] = f"0x{instance.parent_token:08X}"
     obj["killzone_resource_token"] = f"0x{instance.resource_token:08X}"
     obj["killzone_footer"] = f"0x{instance.footer:08X}"
@@ -85,6 +130,9 @@ def _set_instance_source_properties(
     obj["killzone_source_matrix_f32_hex"] = struct.pack(
         "<16f", *instance.matrix
     ).hex()
+    obj["killzone_transform_conversion"] = (
+        "source-row-vector-matrix-transposed-once"
+    )
 
 
 def _set_reference_key_properties(
@@ -94,6 +142,27 @@ def _set_reference_key_properties(
 ) -> None:
     obj[f"{prefix}_section_offset"] = key.section_offset
     obj[f"{prefix}_object_index"] = key.object_index
+
+
+def _set_collision_instance_properties(
+    obj: bpy.types.Object,
+    instance: NativeCollisionMeshInstance,
+) -> None:
+    obj["killzone_collision_group"] = (
+        f"0x{instance.collision_group:08X}"
+    )
+    obj["killzone_collision_enabled"] = instance.collision_enabled
+    obj["killzone_collision_resource_token"] = (
+        f"0x{instance.collision_resource_token:08X}"
+    )
+    obj["killzone_collision_resource_type"] = (
+        instance.collision_resource_type
+    )
+    _set_reference_key_properties(
+        obj,
+        "killzone_collision_resource",
+        instance.collision_resource_key,
+    )
 
 
 def _diagnostic_material() -> bpy.types.Material:
@@ -117,6 +186,14 @@ def _diagnostic_material() -> bpy.types.Material:
     return material
 
 
+def _native_image_intent(texture: NativeLevelTexture) -> str:
+    if texture.pixel_format_name.startswith("ALPHA_"):
+        return "scalar-mask"
+    if texture.pixel_format_name == "GLOW_8":
+        return "unresolved-dynamic-palette"
+    return "visible-color"
+
+
 def _create_level_image(
     texture: NativeLevelTexture,
     rgba: bytes,
@@ -137,11 +214,9 @@ def _create_level_image(
         float_buffer=False,
     )
     image.alpha_mode = "STRAIGHT"
-    image.colorspace_settings.name = (
-        "Non-Color"
-        if texture.pixel_format_name.startswith("ALPHA_")
-        else "sRGB"
-    )
+    image_intent = _native_image_intent(texture)
+    scalar_image = image_intent != "visible-color"
+    image.colorspace_settings.name = "Non-Color" if scalar_image else "sRGB"
 
     pixels = array("f")
     row_size = texture.width * 4
@@ -166,6 +241,7 @@ def _create_level_image(
     image["killzone_mip_count"] = texture.mip_count
     image["killzone_decode_status"] = texture.decode_status
     image["killzone_palette_bank"] = palette_bank
+    image["killzone_image_intent"] = image_intent
     image["killzone_payload_sha256"] = texture.payload_sha256
     image["killzone_decoded_rgba_sha256"] = hashlib.sha256(
         rgba
@@ -211,10 +287,11 @@ def _configure_texture_node(
     node.interpolation = (
         "Closest" if layer.filter_policy == 0 else "Linear"
     )
-    if layer.wrap_s == 0 and layer.wrap_t == 0:
-        node.extension = "REPEAT"
-    elif layer.wrap_s != 0 and layer.wrap_t != 0:
-        node.extension = "EXTEND"
+    node.extension = (
+        "REPEAT"
+        if layer.wrap_s == 0 and layer.wrap_t == 0
+        else "EXTEND"
+    )
     node["killzone_wrap_s"] = (
         "REPEAT" if layer.wrap_s == 0 else "CLAMP"
     )
@@ -222,6 +299,107 @@ def _configure_texture_node(
         "REPEAT" if layer.wrap_t == 0 else "CLAMP"
     )
     node["killzone_filter_policy"] = layer.filter_policy
+
+
+def _connect_mixed_wrap_coordinates(
+    *,
+    nodes: bpy.types.Nodes,
+    links: bpy.types.NodeLinks,
+    coordinate_socket: bpy.types.NodeSocket,
+    layer: object,
+    node_y: float,
+) -> bpy.types.NodeSocket:
+    separate = nodes.new("ShaderNodeSeparateXYZ")
+    separate.name = f"Native Layer {layer.index} Split UV"
+    separate.label = "Native per-axis wrap"
+    separate.location = (-660.0, node_y)
+    links.new(coordinate_socket, separate.inputs["Vector"])
+
+    combine = nodes.new("ShaderNodeCombineXYZ")
+    combine.name = f"Native Layer {layer.index} Wrapped UV"
+    combine.label = (
+        f"U {'repeat' if layer.wrap_s == 0 else 'clamp'}, "
+        f"V {'repeat' if layer.wrap_t == 0 else 'clamp'}"
+    )
+    combine.location = (-420.0, node_y)
+
+    for axis, wrap_value, y_offset in (
+        ("X", layer.wrap_s, 80.0),
+        ("Y", layer.wrap_t, -80.0),
+    ):
+        source = separate.outputs[axis]
+        if wrap_value == 0:
+            repeat = nodes.new("ShaderNodeMath")
+            repeat.name = f"Native Layer {layer.index} {axis} Repeat"
+            repeat.label = f"{axis} repeat (fraction)"
+            repeat.operation = "FRACT"
+            repeat.location = (-520.0, node_y + y_offset)
+            links.new(source, repeat.inputs[0])
+            wrapped = repeat.outputs["Value"]
+        else:
+            lower = nodes.new("ShaderNodeMath")
+            lower.name = f"Native Layer {layer.index} {axis} Clamp Lower"
+            lower.operation = "MAXIMUM"
+            lower.inputs[1].default_value = 0.0
+            lower.location = (-600.0, node_y + y_offset)
+            links.new(source, lower.inputs[0])
+
+            upper = nodes.new("ShaderNodeMath")
+            upper.name = f"Native Layer {layer.index} {axis} Clamp Upper"
+            upper.label = f"{axis} clamp 0..1"
+            upper.operation = "MINIMUM"
+            upper.inputs[1].default_value = 1.0
+            upper.location = (-480.0, node_y + y_offset)
+            links.new(lower.outputs["Value"], upper.inputs[0])
+            wrapped = upper.outputs["Value"]
+        links.new(wrapped, combine.inputs[axis])
+
+    links.new(separate.outputs["Z"], combine.inputs["Z"])
+    return combine.outputs["Vector"]
+
+
+def _connect_axis_aligned_transform_6f(
+    *,
+    nodes: bpy.types.Nodes,
+    links: bpy.types.NodeLinks,
+    coordinate_socket: bpy.types.NodeSocket,
+    layer: object,
+    node_y: float,
+) -> bpy.types.NodeSocket | None:
+    transform = layer.transform_6f
+    if transform is None:
+        return coordinate_socket
+    if len(transform) != 6:
+        raise ValueError("Native six-float UV transform must have six values")
+    scale_u, cross_v_to_u, cross_u_to_v, scale_v, offset_u, offset_v = (
+        transform
+    )
+    tolerance = 1.0e-5
+    if (
+        abs(cross_v_to_u) > tolerance
+        or abs(cross_u_to_v) > tolerance
+    ):
+        return None
+
+    mapping = nodes.new("ShaderNodeMapping")
+    mapping.name = f"Native Layer {layer.index} Axis UV Transform"
+    mapping.label = (
+        "Bounded source UV scale/offset (V-down converted to V-up)"
+    )
+    mapping.vector_type = "POINT"
+    mapping.location = (-650.0, node_y)
+    mapping.inputs["Location"].default_value = (
+        offset_u,
+        1.0 - scale_v - offset_v,
+        0.0,
+    )
+    mapping.inputs["Scale"].default_value = (
+        scale_u,
+        scale_v,
+        1.0,
+    )
+    links.new(coordinate_socket, mapping.inputs["Vector"])
+    return mapping.outputs["Vector"]
 
 
 def _connect_layer_coordinates(
@@ -232,7 +410,7 @@ def _connect_layer_coordinates(
     layer: object,
     node_y: float,
 ) -> str:
-    if layer.matrix_4x4 is not None or layer.transform_6f is not None:
+    if layer.matrix_4x4 is not None:
         return "preserved-unconnected-transform-convention-unresolved"
     selector = layer.coordinate_selector
     if selector in (0, 1, 2, 3, 4, 5, 6, 7):
@@ -240,12 +418,46 @@ def _connect_layer_coordinates(
         uv_node = nodes.new("ShaderNodeUVMap")
         uv_node.name = f"Native Layer {layer.index} UV{uv_index}"
         uv_node.label = (
-            f"Selector {selector}: Native UV{uv_index}, V-down source"
+            f"Selector {selector}: Native UV{uv_index}, V-up host"
         )
         uv_node.uv_map = f"Native UV{uv_index}"
         uv_node.location = (-820.0, node_y)
-        links.new(uv_node.outputs["UV"], image_node.inputs["Vector"])
-        return f"connected-native-uv{uv_index}"
+        coordinate_socket = uv_node.outputs["UV"]
+        coordinate_socket = _connect_axis_aligned_transform_6f(
+            nodes=nodes,
+            links=links,
+            coordinate_socket=coordinate_socket,
+            layer=layer,
+            node_y=node_y,
+        )
+        if coordinate_socket is None:
+            nodes.remove(uv_node)
+            return "preserved-unconnected-transform-convention-unresolved"
+        transform_suffix = (
+            "-bounded-axis-transform6f"
+            if layer.transform_6f is not None
+            else ""
+        )
+        if (layer.wrap_s == 0) != (layer.wrap_t == 0):
+            coordinate_socket = _connect_mixed_wrap_coordinates(
+                nodes=nodes,
+                links=links,
+                coordinate_socket=coordinate_socket,
+                layer=layer,
+                node_y=node_y,
+            )
+            route_status = (
+                f"connected-native-uv{uv_index}{transform_suffix}"
+                "-mixed-axis-wrap"
+            )
+        else:
+            route_status = (
+                f"connected-native-uv{uv_index}{transform_suffix}"
+            )
+        links.new(coordinate_socket, image_node.inputs["Vector"])
+        return route_status
+    if layer.transform_6f is not None:
+        return "preserved-unconnected-transform-convention-unresolved"
     if selector == 8:
         return "preserved-unconnected-generated-environment"
     if selector in (9, 10):
@@ -276,7 +488,10 @@ def _native_material(
     principled = nodes.new("ShaderNodeBsdfPrincipled")
     principled.location = (120.0, 0.0)
     principled.inputs["Roughness"].default_value = 0.72
-    principled.inputs["Metallic"].default_value = 0.08
+    principled.inputs["Metallic"].default_value = 0.0
+    specular = principled.inputs.get("Specular IOR Level")
+    if specular is not None:
+        specular.default_value = 0.0
     object_info = nodes.new("ShaderNodeObjectInfo")
     object_info.location = (-180.0, 0.0)
     links.new(object_info.outputs["Color"], principled.inputs["Base Color"])
@@ -321,6 +536,7 @@ def _native_material(
         node_y = -300.0 * layer.index
         if layer.kind == "texture":
             texture = textures_by_token[layer.resource_token]
+            image_intent = _native_image_intent(texture)
             image_bank = (
                 layer.palette_policy
                 if texture.base_rgba_complement is not None
@@ -352,6 +568,7 @@ def _native_material(
             )
             node["killzone_decode_status"] = texture.decode_status
             node["killzone_palette_policy"] = layer.palette_policy
+            node["killzone_image_intent"] = image_intent
             node["killzone_coordinate_route_status"] = route_status
             node["killzone_operation"] = layer.operation
             node["killzone_operation_name"] = _OPERATION_NAMES[
@@ -362,6 +579,7 @@ def _native_material(
                     "pixel_format": texture.pixel_format_name,
                     "sampling_psm": texture.sampling_psm,
                     "decode_status": texture.decode_status,
+                    "image_intent": image_intent,
                     "effective_image_bank": image_bank,
                     "coordinate_route_status": route_status,
                 }
@@ -390,6 +608,7 @@ def _native_material(
             animation = animations_by_token[layer.resource_token]
             first_frame = animation.frames[0]
             first_texture = textures_by_token[first_frame.texture_token]
+            image_intent = _native_image_intent(first_texture)
             image_bank = (
                 layer.palette_policy
                 if first_texture.base_rgba_complement is not None
@@ -420,6 +639,7 @@ def _native_material(
                 f"0x{layer.resource_token:08X}"
             )
             node["killzone_palette_policy"] = layer.palette_policy
+            node["killzone_image_intent"] = image_intent
             node["killzone_coordinate_route_status"] = route_status
             node["killzone_operation"] = layer.operation
             node["killzone_operation_name"] = _OPERATION_NAMES[
@@ -438,6 +658,7 @@ def _native_material(
             )
             document["frames"] = frames
             document["coordinate_route_status"] = route_status
+            document["image_intent"] = image_intent
         elif layer.kind == "null_texture":
             node = nodes.new("ShaderNodeTexImage")
             node.name = f"Native Null Provider Layer {layer.index}"
@@ -451,6 +672,18 @@ def _native_material(
             ]
         layer_documents.append(document)
 
+    material["killzone_bounded_layerbumpdot3_candidate"] = (
+        supports_bounded_native_layerbumpdot3_preview(
+            native.layers,
+            textures_by_token,
+        )
+    )
+    material["killzone_maskedwrite_alphaadd_cutout_candidate"] = (
+        supports_diagnostic_native_maskedwrite_alphaadd_preview(
+            native.layers,
+            textures_by_token,
+        )
+    )
     material.diffuse_color = (0.8, 0.35, 0.08, 1.0)
     material["killzone_source_level"] = level_path
     material["killzone_core_local_token"] = (
@@ -461,6 +694,27 @@ def _native_material(
         separators=(",", ":"),
     )
     material["killzone_layer_images_connected_to_shader"] = False
+    unimplemented_state = {
+        "native-vu-lighting",
+        "runtime-layer-mask-and-mutation",
+        "per-pass-depth-and-framebuffer-state",
+    }
+    if len(native.layers) > 1:
+        unimplemented_state.add("general-multipass-composition")
+    if any(
+        layer.coordinate_selector >= 8
+        or layer.matrix_4x4 is not None
+        or layer.transform_6f is not None
+        for layer in native.layers
+    ):
+        unimplemented_state.add("generated-or-transformed-coordinates")
+    if any(layer.kind == "animated_texture" for layer in native.layers):
+        unimplemented_state.add("animated-texture-timing-and-looping")
+    material["killzone_shader_profile"] = "unresolved"
+    material["killzone_shader_unimplemented_state_json"] = json.dumps(
+        sorted(unimplemented_state),
+        separators=(",", ":"),
+    )
     material["killzone_shader_status"] = (
         "Diagnostic object color; native layer state and proven direct UV "
         "routes are inspectable, but VU source color and runtime mutation "
@@ -496,6 +750,272 @@ def _ensure_shader_node(
     node = nodes.new(node_type)
     node.name = name
     return node
+
+
+def _quantized_alpha_byte(
+    *,
+    nodes: bpy.types.Nodes,
+    links: bpy.types.NodeLinks,
+    alpha_socket: bpy.types.NodeSocket,
+    prefix: str,
+) -> bpy.types.NodeSocket:
+    lower = _ensure_shader_node(
+        nodes,
+        "ShaderNodeMath",
+        f"{prefix} Clamp Lower",
+    )
+    lower.operation = "MAXIMUM"
+    lower.inputs[1].default_value = 0.0
+    _replace_input_link(links, lower.inputs[0], alpha_socket)
+
+    upper = _ensure_shader_node(
+        nodes,
+        "ShaderNodeMath",
+        f"{prefix} Clamp Upper",
+    )
+    upper.operation = "MINIMUM"
+    upper.inputs[1].default_value = 1.0
+    _replace_input_link(
+        links,
+        upper.inputs[0],
+        lower.outputs["Value"],
+    )
+
+    scale = _ensure_shader_node(
+        nodes,
+        "ShaderNodeMath",
+        f"{prefix} Byte Scale",
+    )
+    scale.operation = "MULTIPLY"
+    scale.inputs[1].default_value = 255.0
+    _replace_input_link(
+        links,
+        scale.inputs[0],
+        upper.outputs["Value"],
+    )
+
+    quantize = _ensure_shader_node(
+        nodes,
+        "ShaderNodeMath",
+        f"{prefix} Byte Quantize",
+    )
+    quantize.operation = "ROUND"
+    _replace_input_link(
+        links,
+        quantize.inputs[0],
+        scale.outputs["Value"],
+    )
+    return quantize.outputs["Value"]
+
+
+def _native_alpha_test_mask(
+    *,
+    nodes: bpy.types.Nodes,
+    links: bpy.types.NodeLinks,
+    alpha_socket: bpy.types.NodeSocket,
+    layer: Mapping[str, object],
+) -> bpy.types.NodeSocket | None:
+    alpha_test = int(layer.get("alpha_test", 7))
+    if alpha_test == 7:
+        return None
+    reference = native_alpha_reference_byte(
+        int(layer.get("alpha_reference", 0))
+    )
+    layer_index = int(layer.get("index", 0))
+    prefix = f"Native Layer {layer_index} Alpha Test"
+
+    if alpha_test == 0:
+        never = _ensure_shader_node(
+            nodes,
+            "ShaderNodeValue",
+            f"{prefix} Never",
+        )
+        never.label = "Native alpha test NEVER"
+        never.outputs["Value"].default_value = 0.0
+        return never.outputs["Value"]
+
+    quantized_alpha = _quantized_alpha_byte(
+        nodes=nodes,
+        links=links,
+        alpha_socket=alpha_socket,
+        prefix=prefix,
+    )
+
+    comparison = _ensure_shader_node(
+        nodes,
+        "ShaderNodeMath",
+        f"{prefix} Compare",
+    )
+    _replace_input_link(
+        links,
+        comparison.inputs[0],
+        quantized_alpha,
+    )
+    comparison["killzone_alpha_test"] = alpha_test
+    comparison["killzone_runtime_alpha_reference"] = reference
+
+    if alpha_test == 1:
+        comparison.operation = "LESS_THAN"
+        comparison.inputs[1].default_value = float(reference)
+    elif alpha_test == 2:
+        comparison.operation = "COMPARE"
+        comparison.inputs[1].default_value = float(reference)
+        comparison.inputs[2].default_value = 0.1
+    elif alpha_test == 3:
+        comparison.operation = "LESS_THAN"
+        comparison.inputs[1].default_value = reference + 0.5
+    elif alpha_test == 4:
+        comparison.operation = "GREATER_THAN"
+        comparison.inputs[1].default_value = float(reference)
+    elif alpha_test == 5:
+        comparison.operation = "COMPARE"
+        comparison.inputs[1].default_value = float(reference)
+        comparison.inputs[2].default_value = 0.1
+        invert = _ensure_shader_node(
+            nodes,
+            "ShaderNodeMath",
+            f"{prefix} Invert",
+        )
+        invert.operation = "SUBTRACT"
+        invert.inputs[0].default_value = 1.0
+        _replace_input_link(
+            links,
+            invert.inputs[1],
+            comparison.outputs["Value"],
+        )
+        return invert.outputs["Value"]
+    elif alpha_test == 6:
+        comparison.operation = "GREATER_THAN"
+        comparison.inputs[1].default_value = reference - 0.5
+    else:
+        raise ValueError(f"Unsupported native alpha test {alpha_test}")
+    return comparison.outputs["Value"]
+
+
+def _decoded_alpha_greater_mask(
+    *,
+    nodes: bpy.types.Nodes,
+    links: bpy.types.NodeLinks,
+    alpha_socket: bpy.types.NodeSocket,
+    decoded_reference: int,
+) -> bpy.types.NodeSocket:
+    if not 0 <= decoded_reference <= 0xFF:
+        raise ValueError("Decoded alpha reference must be a byte")
+    prefix = "Native MASKEDWRITE Decoded Alpha Cutout"
+    quantized_alpha = _quantized_alpha_byte(
+        nodes=nodes,
+        links=links,
+        alpha_socket=alpha_socket,
+        prefix=prefix,
+    )
+    comparison = _ensure_shader_node(
+        nodes,
+        "ShaderNodeMath",
+        f"{prefix} Compare",
+    )
+    comparison.operation = "GREATER_THAN"
+    comparison.inputs[1].default_value = float(decoded_reference)
+    comparison["killzone_decoded_alpha_comparison"] = "GREATER"
+    comparison["killzone_decoded_alpha_reference"] = decoded_reference
+    comparison["killzone_runtime_alpha_reference"] = (
+        native_alpha_reference_byte(decoded_reference)
+    )
+    _replace_input_link(
+        links,
+        comparison.inputs[0],
+        quantized_alpha,
+    )
+    return comparison.outputs["Value"]
+
+
+def _multiply_alpha_sockets(
+    *,
+    nodes: bpy.types.Nodes,
+    links: bpy.types.NodeLinks,
+    left: bpy.types.NodeSocket,
+    right: bpy.types.NodeSocket,
+    name: str,
+) -> bpy.types.NodeSocket:
+    multiply = _ensure_shader_node(
+        nodes,
+        "ShaderNodeMath",
+        name,
+    )
+    multiply.operation = "MULTIPLY"
+    multiply.use_clamp = True
+    _replace_input_link(links, multiply.inputs[0], left)
+    _replace_input_link(links, multiply.inputs[1], right)
+    return multiply.outputs["Value"]
+
+
+def _connect_emission_surface(
+    *,
+    material: bpy.types.Material,
+    nodes: bpy.types.Nodes,
+    links: bpy.types.NodeLinks,
+    color_socket: bpy.types.NodeSocket,
+    alpha_socket: bpy.types.NodeSocket | None,
+    render_method: str,
+) -> None:
+    output = next(
+        (node for node in nodes if node.type == "OUTPUT_MATERIAL"),
+        None,
+    )
+    if output is None:
+        raise RuntimeError("Native material has no Material Output node")
+
+    emission = _ensure_shader_node(
+        nodes,
+        "ShaderNodeEmission",
+        "Killzone Preview Emission",
+    )
+    emission.label = "Unlit native color preview"
+    emission.inputs["Strength"].default_value = 1.0
+    emission.location = (120.0, -180.0)
+    _replace_input_link(
+        links,
+        emission.inputs["Color"],
+        color_socket,
+    )
+
+    if alpha_socket is None:
+        _replace_input_link(
+            links,
+            output.inputs["Surface"],
+            emission.outputs["Emission"],
+        )
+        return
+
+    transparent = _ensure_shader_node(
+        nodes,
+        "ShaderNodeBsdfTransparent",
+        "Killzone Preview Transparent",
+    )
+    transparent.location = (120.0, -300.0)
+    mix = _ensure_shader_node(
+        nodes,
+        "ShaderNodeMixShader",
+        "Killzone Preview Surface Mix",
+    )
+    mix.label = "Native source alpha / alpha test"
+    mix.location = (340.0, -180.0)
+    _replace_input_link(links, mix.inputs[0], alpha_socket)
+    _replace_input_link(
+        links,
+        mix.inputs[1],
+        transparent.outputs["BSDF"],
+    )
+    _replace_input_link(
+        links,
+        mix.inputs[2],
+        emission.outputs["Emission"],
+    )
+    _replace_input_link(
+        links,
+        output.inputs["Surface"],
+        mix.outputs["Shader"],
+    )
+    material.surface_render_method = render_method
 
 
 def supports_bounded_native_alphaadd_preview(
@@ -535,6 +1055,360 @@ def supports_bounded_native_alphaadd_preview(
         and layer.get("fade_mode") in (0, 2)
         and layer.get("vu_features") == [False, False]
     )
+
+
+def _connect_bounded_native_layerbumpdot3_preview(
+    *,
+    material: bpy.types.Material,
+    layer_documents: list[Mapping[str, object]],
+    nodes: bpy.types.Nodes,
+    links: bpy.types.NodeLinks,
+    principled: bpy.types.Node,
+) -> bool:
+    if not material.get("killzone_bounded_layerbumpdot3_candidate"):
+        return False
+    if len(layer_documents) != 2:
+        return False
+    base_layer, detail_layer = layer_documents
+    if not (
+        base_layer.get("index") == 0
+        and base_layer.get("operation") == 5
+        and base_layer.get("pixel_format") in ("INDEX_4", "INDEX_8")
+        and base_layer.get("coordinate_route_status")
+        == "connected-native-uv0"
+        and detail_layer.get("index") == 1
+        and detail_layer.get("operation") == 18
+        and detail_layer.get("pixel_format") == "ALPHA_8"
+        and detail_layer.get("coordinate_route_status")
+        == "connected-native-uv1"
+    ):
+        return False
+
+    image_nodes: dict[int, bpy.types.Node] = {}
+    for node in nodes:
+        if (
+            node.type == "TEX_IMAGE"
+            and node.image is not None
+            and node.get("killzone_layer_index") in (0, 1)
+        ):
+            image_nodes[int(node["killzone_layer_index"])] = node
+    if image_nodes.keys() != {0, 1}:
+        return False
+    base_image = image_nodes[0]
+    detail_image = image_nodes[1]
+    if base_image.extension != "REPEAT" or detail_image.extension != "EXTEND":
+        return False
+    lighting_mode = int(base_layer.get("lighting_mode", -1))
+    if lighting_mode not in (0, 1):
+        return False
+
+    base_color_socket = base_image.outputs["Color"]
+    if lighting_mode == 1:
+        _connect_v4_8_modulation(
+            nodes=nodes,
+            links=links,
+            principled=principled,
+            image_node=base_image,
+            diagnostic=False,
+        )
+        base_color_socket = nodes[
+            "Native Layer 0 RGB Scale"
+        ].outputs["Vector"]
+
+    alpha_byte = _ensure_shader_node(
+        nodes,
+        "ShaderNodeMath",
+        "Native Layer 1 Alpha Byte",
+    )
+    alpha_byte.operation = "MULTIPLY"
+    alpha_byte.use_clamp = False
+    alpha_byte.label = "At byte = texture alpha * 255"
+    alpha_byte.location = (-250.0, -380.0)
+    alpha_byte.inputs[1].default_value = 255.0
+    _replace_input_link(
+        links,
+        alpha_byte.inputs[0],
+        detail_image.outputs["Alpha"],
+    )
+
+    fragment_alpha = _ensure_shader_node(
+        nodes,
+        "ShaderNodeMath",
+        "Native Layer 1 Fragment Alpha",
+    )
+    fragment_alpha.operation = "ADD"
+    fragment_alpha.use_clamp = False
+    fragment_alpha.label = (
+        "GS HIGHLIGHT: At + trunc(V4-8 alpha 127 / 2)"
+    )
+    fragment_alpha.location = (-30.0, -380.0)
+    fragment_alpha.inputs[1].default_value = float(
+        NATIVE_LAYERBUMPDOT3_FRAGMENT_ALPHA
+    )
+    _replace_input_link(
+        links,
+        fragment_alpha.inputs[0],
+        alpha_byte.outputs["Value"],
+    )
+
+    highlight_clamp = _ensure_shader_node(
+        nodes,
+        "ShaderNodeMath",
+        "Native Layer 1 HIGHLIGHT Clamp",
+    )
+    highlight_clamp.operation = "MINIMUM"
+    highlight_clamp.use_clamp = False
+    highlight_clamp.label = "As = min(At + 63, 255)"
+    highlight_clamp.location = (190.0, -380.0)
+    highlight_clamp.inputs[1].default_value = 255.0
+    _replace_input_link(
+        links,
+        highlight_clamp.inputs[0],
+        fragment_alpha.outputs["Value"],
+    )
+
+    multiplier = _ensure_shader_node(
+        nodes,
+        "ShaderNodeMath",
+        "Native Layer 1 GS Multiplier",
+    )
+    multiplier.operation = "DIVIDE"
+    multiplier.use_clamp = False
+    multiplier.label = "Blend 0x89 factor: As / 128"
+    multiplier.location = (410.0, -380.0)
+    multiplier.inputs[1].default_value = float(NATIVE_GS_COLOR_ONE)
+    _replace_input_link(
+        links,
+        multiplier.inputs[0],
+        highlight_clamp.outputs["Value"],
+    )
+
+    framebuffer_scale = _ensure_shader_node(
+        nodes,
+        "ShaderNodeVectorMath",
+        "Native LayerBumpDot3 Framebuffer Scale",
+    )
+    framebuffer_scale.operation = "SCALE"
+    framebuffer_scale.label = "Layer 0 RGB * min(At + 63, 255) / 128"
+    framebuffer_scale.location = (640.0, -80.0)
+    _replace_input_link(
+        links,
+        framebuffer_scale.inputs[0],
+        base_color_socket,
+    )
+    _replace_input_link(
+        links,
+        framebuffer_scale.inputs[3],
+        multiplier.outputs["Value"],
+    )
+
+    _replace_input_link(
+        links,
+        principled.inputs["Base Color"],
+        framebuffer_scale.outputs["Vector"],
+    )
+    _replace_input_link(
+        links,
+        principled.inputs["Emission Color"],
+        framebuffer_scale.outputs["Vector"],
+    )
+    for link in tuple(principled.inputs["Alpha"].links):
+        links.remove(link)
+    principled.inputs["Alpha"].default_value = 1.0
+    principled.inputs["Emission Strength"].default_value = 0.35
+    _connect_emission_surface(
+        material=material,
+        nodes=nodes,
+        links=links,
+        color_socket=framebuffer_scale.outputs["Vector"],
+        alpha_socket=None,
+        render_method="DITHERED",
+    )
+
+    detail_image["killzone_preview_role"] = (
+        "framebuffer-alpha-multiplier-not-normal-map"
+    )
+    material["killzone_layer_images_connected_to_shader"] = True
+    material["killzone_preview_mode"] = (
+        "two-layer-alphaadd-layerbumpdot3"
+    )
+    material["killzone_preview_layer_index"] = 0
+    material["killzone_preview_layer_indices_json"] = "[0,1]"
+    material["killzone_preview_detail_layer_index"] = 1
+    material["killzone_preview_alpha_connected"] = False
+    material["killzone_preview_ps2_color_one"] = NATIVE_GS_COLOR_ONE
+    material["killzone_preview_fragment_alpha_byte"] = (
+        NATIVE_LAYERBUMPDOT3_FRAGMENT_ALPHA
+    )
+    material["killzone_preview_v4_8_alpha_byte"] = (
+        NATIVE_LAYERBUMPDOT3_V4_8_ALPHA
+    )
+    material["killzone_preview_fragment_alpha_source"] = (
+        "uniform-native-v4-8-alpha-div-2"
+    )
+    material["killzone_preview_base_v4_8_rgb_modulation"] = (
+        lighting_mode == 1
+    )
+    material["killzone_preview_detail_tfx"] = "HIGHLIGHT"
+    material["killzone_preview_gs_alpha_policy"] = "0x89"
+    material["killzone_preview_native_equation"] = (
+        "layer0.rgb * min(layer1.alpha_byte + 63, 255) / 128"
+    )
+    material["killzone_preview_emission_strength"] = 1.0
+    material["killzone_shader_profile"] = "bounded-native-preview"
+    unimplemented_state = [
+        "framebuffer-history-before-layer0",
+        "gs-byte-quantization-and-final-channel-clamp",
+    ]
+    if lighting_mode == 1:
+        unimplemented_state.append(
+            "complete-native-vu-lighting-before-layer0"
+        )
+    material["killzone_shader_unimplemented_state_json"] = json.dumps(
+        unimplemented_state,
+        separators=(",", ":"),
+    )
+    material["killzone_shader_status"] = (
+        "Resolved bounded direct-UV0/UV1 ALPHAADD + LAYERBUMPDOT3 "
+        "composition: uniform V4-8 A=127 produces fragment alpha 63; "
+        "layer 1 uses GS HIGHLIGHT min(At + 63, 255) "
+        "and blend 0x89 destination scaling by As/128; framebuffer history "
+        "before layer 0 and byte quantization remain host limitations"
+    )
+    return True
+
+
+def _connect_diagnostic_native_maskedwrite_alphaadd_preview(
+    *,
+    material: bpy.types.Material,
+    layer_documents: list[Mapping[str, object]],
+    nodes: bpy.types.Nodes,
+    links: bpy.types.NodeLinks,
+    principled: bpy.types.Node,
+) -> bool:
+    if not material.get(
+        "killzone_maskedwrite_alphaadd_cutout_candidate"
+    ):
+        return False
+    if len(layer_documents) != 2:
+        return False
+    masked_write, alpha_add = layer_documents
+    if not (
+        masked_write.get("index") == 0
+        and masked_write.get("kind") == "texture"
+        and masked_write.get("operation") == 8
+        and masked_write.get("z_write") == 1
+        and masked_write.get("alpha_test") == 4
+        and masked_write.get("alpha_reference")
+        == NATIVE_MASKEDWRITE_DECODED_ALPHA_CUTOFF
+        and masked_write.get("pixel_format")
+        in ("INDEX_4", "INDEX_8", "RGBA_8888")
+        and masked_write.get("coordinate_route_status")
+        == "connected-native-uv0"
+        and alpha_add.get("index") == 1
+        and alpha_add.get("kind") == "texture"
+        and alpha_add.get("operation") == 5
+        and alpha_add.get("z_write") == 0
+        and alpha_add.get("resource_token")
+        == masked_write.get("resource_token")
+        and alpha_add.get("effective_image_bank")
+        == masked_write.get("effective_image_bank")
+        and alpha_add.get("coordinate_route_status")
+        == "connected-native-uv0"
+    ):
+        return False
+
+    image_nodes: dict[int, bpy.types.Node] = {}
+    for node in nodes:
+        if (
+            node.type == "TEX_IMAGE"
+            and node.image is not None
+            and node.get("killzone_layer_index") in (0, 1)
+        ):
+            image_nodes[int(node["killzone_layer_index"])] = node
+    if image_nodes.keys() != {0, 1}:
+        return False
+    masked_write_image = image_nodes[0]
+    alpha_add_image = image_nodes[1]
+    if masked_write_image.image != alpha_add_image.image:
+        return False
+
+    cutout_mask = _decoded_alpha_greater_mask(
+        nodes=nodes,
+        links=links,
+        alpha_socket=masked_write_image.outputs["Alpha"],
+        decoded_reference=NATIVE_MASKEDWRITE_DECODED_ALPHA_CUTOFF,
+    )
+    _replace_input_link(
+        links,
+        principled.inputs["Base Color"],
+        masked_write_image.outputs["Color"],
+    )
+    _replace_input_link(
+        links,
+        principled.inputs["Emission Color"],
+        masked_write_image.outputs["Color"],
+    )
+    _replace_input_link(
+        links,
+        principled.inputs["Alpha"],
+        cutout_mask,
+    )
+    principled.inputs["Emission Strength"].default_value = 0.35
+    _connect_emission_surface(
+        material=material,
+        nodes=nodes,
+        links=links,
+        color_socket=masked_write_image.outputs["Color"],
+        alpha_socket=cutout_mask,
+        render_method="DITHERED",
+    )
+
+    masked_write_image["killzone_preview_role"] = (
+        "decoded-color-and-layer0-cutout-alpha"
+    )
+    alpha_add_image["killzone_preview_role"] = (
+        "preserved-layer1-low-alpha-fringe-not-composed"
+    )
+    material["killzone_layer_images_connected_to_shader"] = True
+    material["killzone_preview_mode"] = (
+        "two-layer-maskedwrite-alphaadd-cutout"
+    )
+    material["killzone_preview_layer_index"] = 0
+    material["killzone_preview_layer_indices_json"] = "[0,1]"
+    material["killzone_preview_alpha_connected"] = True
+    material["killzone_preview_alpha_test"] = 4
+    material["killzone_preview_alpha_reference_byte"] = (
+        native_alpha_reference_byte(
+            NATIVE_MASKEDWRITE_DECODED_ALPHA_CUTOFF
+        )
+    )
+    material["killzone_preview_decoded_alpha_cutoff_byte"] = (
+        NATIVE_MASKEDWRITE_DECODED_ALPHA_CUTOFF
+    )
+    material["killzone_preview_decoded_alpha_comparison"] = "GREATER"
+    material["killzone_preview_gs_afail"] = "KEEP"
+    material["killzone_preview_second_pass_composed"] = False
+    material["killzone_preview_emission_strength"] = 1.0
+    material["killzone_shader_profile"] = "artist-approximation"
+    material["killzone_shader_unimplemented_state_json"] = json.dumps(
+        [
+            "layer0-maskedwrite-additive-rgb-contribution",
+            "layer1-alphaadd-low-alpha-fringe",
+            "per-pass-depth-and-framebuffer-state",
+            "framebuffer-alpha-preservation",
+            "per-pass-tfx-vu-and-alpha-source",
+            "gs-intermediate-clamp",
+        ],
+        separators=(",", ":"),
+    )
+    material["killzone_shader_status"] = (
+        "Diagnostic same-texture UV0 MASKEDWRITE + ALPHAADD foliage "
+        "cutout using strict decoded alpha > 204; AFAIL KEEP coverage is "
+        "represented, but the first-pass additive RGB/depth effects and "
+        "the second-pass low-alpha fringe are not composed"
+    )
+    return True
 
 
 def select_native_color_diagnostic_layer(
@@ -675,7 +1549,7 @@ def _connect_v4_8_modulation(
         "Native Layer 0 Alpha Scale",
     )
     alpha_scale.operation = "MULTIPLY"
-    alpha_scale.use_clamp = True
+    alpha_scale.use_clamp = False
     alpha_scale.location = (180.0, -180.0)
     alpha_scale.inputs[1].default_value = 255.0 / 128.0
     _replace_input_link(
@@ -763,6 +1637,12 @@ def _connect_native_color_diagnostic(
             image_node=image_node,
             diagnostic=True,
         )
+        color_socket = nodes[
+            "Native Layer 0 RGB Scale"
+        ].outputs["Vector"]
+        source_alpha_socket = nodes[
+            "Native Layer 0 Alpha Scale"
+        ].outputs["Value"]
     else:
         _replace_input_link(
             links,
@@ -774,6 +1654,8 @@ def _connect_native_color_diagnostic(
             principled.inputs["Emission Color"],
             image_node.outputs["Color"],
         )
+        color_socket = image_node.outputs["Color"]
+        source_alpha_socket = image_node.outputs["Alpha"]
     resource_token = layer["resource_token"]
     uses_alpha = (
         operation in (5, 8)
@@ -786,21 +1668,51 @@ def _connect_native_color_diagnostic(
             for candidate in layer_documents[layer_index + 1 :]
         )
     )
+    alpha_test_mask = _native_alpha_test_mask(
+        nodes=nodes,
+        links=links,
+        alpha_socket=source_alpha_socket,
+        layer=layer,
+    )
+    opacity_socket: bpy.types.NodeSocket | None
+    render_method = "DITHERED"
     if uses_alpha:
-        if not use_v4_8:
-            _replace_input_link(
-                links,
-                principled.inputs["Alpha"],
-                image_node.outputs["Alpha"],
+        opacity_socket = source_alpha_socket
+        if alpha_test_mask is not None:
+            opacity_socket = _multiply_alpha_sockets(
+                nodes=nodes,
+                links=links,
+                left=source_alpha_socket,
+                right=alpha_test_mask,
+                name=(
+                    f"Native Layer {layer_index} Preview Alpha Test"
+                ),
             )
-        material.surface_render_method = (
-            "DITHERED" if operation == 8 else "BLENDED"
+        render_method = "DITHERED" if operation == 8 else "BLENDED"
+    elif alpha_test_mask is not None:
+        opacity_socket = alpha_test_mask
+    else:
+        opacity_socket = None
+
+    if opacity_socket is not None:
+        _replace_input_link(
+            links,
+            principled.inputs["Alpha"],
+            opacity_socket,
         )
     else:
         for link in tuple(principled.inputs["Alpha"].links):
             links.remove(link)
         principled.inputs["Alpha"].default_value = 1.0
-        material.surface_render_method = "DITHERED"
+
+    _connect_emission_surface(
+        material=material,
+        nodes=nodes,
+        links=links,
+        color_socket=color_socket,
+        alpha_socket=opacity_socket,
+        render_method=render_method,
+    )
 
     principled.inputs["Emission Strength"].default_value = 0.35
     operation_name = str(layer["operation_name"])
@@ -818,18 +1730,27 @@ def _connect_native_color_diagnostic(
         layer["pixel_format"]
     )
     material["killzone_preview_alpha_connected"] = uses_alpha
+    material["killzone_preview_alpha_test"] = int(
+        layer.get("alpha_test", 7)
+    )
+    material["killzone_preview_alpha_reference_byte"] = (
+        native_alpha_reference_byte(
+            int(layer.get("alpha_reference", 0))
+        )
+    )
     material["killzone_preview_transform_ignored"] = transform_ignored
     material["killzone_preview_v4_8_modulation"] = use_v4_8
-    material["killzone_preview_emission_strength"] = 0.35
+    material["killzone_preview_emission_strength"] = 1.0
+    material["killzone_shader_profile"] = "artist-approximation"
     material["killzone_shader_status"] = (
         (
-            f"Diagnostic decoded color from layer {layer_index} "
+            f"Unlit diagnostic decoded color from layer {layer_index} "
             f"{operation_name}, modulated by serialized Native V4-8; "
             "native depth/blend state and lighting remain unreconstructed"
         )
         if use_v4_8
         else (
-            f"Diagnostic decoded color from layer {layer_index} "
+            f"Unlit diagnostic decoded color from layer {layer_index} "
             f"{operation_name}; native lighting and multi-layer composition "
             "remain unreconstructed"
         )
@@ -878,6 +1799,49 @@ def enable_bounded_native_material_previews(
         if principled is None:
             continue
 
+        raw_layers = material.get("killzone_layers_json")
+        if not isinstance(raw_layers, str):
+            continue
+        layer_documents = json.loads(raw_layers)
+
+        meshes = user_meshes[material]
+        if (
+            meshes
+            and all(
+                _mesh_material_has_native_v4_8(mesh, material)
+                and _mesh_material_native_v4_8_alpha_range(
+                    mesh,
+                    material,
+                )
+                == (
+                    NATIVE_LAYERBUMPDOT3_V4_8_ALPHA,
+                    NATIVE_LAYERBUMPDOT3_V4_8_ALPHA,
+                )
+                for mesh in meshes
+            )
+            and _connect_bounded_native_layerbumpdot3_preview(
+                material=material,
+                layer_documents=layer_documents,
+                nodes=nodes,
+                links=links,
+                principled=principled,
+            )
+        ):
+            counts["layerbumpdot3"] = (
+                counts.get("layerbumpdot3", 0) + 1
+            )
+            continue
+
+        if _connect_diagnostic_native_maskedwrite_alphaadd_preview(
+            material=material,
+            layer_documents=layer_documents,
+            nodes=nodes,
+            links=links,
+            principled=principled,
+        ):
+            counts["maskedwrite"] = counts.get("maskedwrite", 0) + 1
+            continue
+
         if include_write:
             write_node = next(
                 (
@@ -896,7 +1860,17 @@ def enable_bounded_native_material_previews(
                 ),
                 None,
             )
-            if write_node is not None:
+            if write_node is not None and layer_documents:
+                layer = layer_documents[0]
+                coordinate_route = str(
+                    write_node.get(
+                        "killzone_coordinate_route_status",
+                        "",
+                    )
+                )
+                bounded_axis_transform = (
+                    "-bounded-axis-transform6f" in coordinate_route
+                )
                 _replace_input_link(
                     links,
                     principled.inputs["Base Color"],
@@ -910,26 +1884,69 @@ def enable_bounded_native_material_previews(
                 principled.inputs[
                     "Emission Strength"
                 ].default_value = 0.35
+                alpha_test_mask = _native_alpha_test_mask(
+                    nodes=nodes,
+                    links=links,
+                    alpha_socket=write_node.outputs["Alpha"],
+                    layer=layer,
+                )
+                if alpha_test_mask is not None:
+                    _replace_input_link(
+                        links,
+                        principled.inputs["Alpha"],
+                        alpha_test_mask,
+                    )
+                _connect_emission_surface(
+                    material=material,
+                    nodes=nodes,
+                    links=links,
+                    color_socket=write_node.outputs["Color"],
+                    alpha_socket=alpha_test_mask,
+                    render_method="DITHERED",
+                )
                 material[
                     "killzone_preview_base_write_connected"
                 ] = True
-                material["killzone_preview_emission_strength"] = 0.35
+                material["killzone_preview_emission_strength"] = 1.0
                 material[
                     "killzone_layer_images_connected_to_shader"
                 ] = True
                 material["killzone_preview_mode"] = "layer0-write"
                 material["killzone_preview_layer_index"] = 0
+                material["killzone_preview_coordinate_route"] = (
+                    coordinate_route
+                )
+                material["killzone_preview_transform_6f_applied"] = (
+                    bounded_axis_transform
+                )
+                material["killzone_preview_alpha_test"] = int(
+                    layer.get("alpha_test", 7)
+                )
+                material["killzone_preview_alpha_reference_byte"] = (
+                    native_alpha_reference_byte(
+                        int(layer.get("alpha_reference", 0))
+                    )
+                )
+                material["killzone_shader_profile"] = (
+                    "bounded-native-preview"
+                )
+                material["killzone_shader_status"] = (
+                    "Unlit "
+                    + (
+                        "axis-transformed direct-UV "
+                        if bounded_axis_transform
+                        else "direct-UV "
+                    )
+                    + "WRITE preview with native alpha-test "
+                    "semantics; native VU lighting and framebuffer state "
+                    "remain unreconstructed"
+                )
                 counts["write"] += 1
                 continue
 
-        raw_layers = material.get("killzone_layers_json")
-        if not isinstance(raw_layers, str):
-            continue
-        layer_documents = json.loads(raw_layers)
         if include_color_diagnostics:
-            meshes = user_meshes[material]
             has_v4_8 = bool(meshes) and all(
-                mesh.color_attributes.get("Native V4-8") is not None
+                _mesh_material_has_native_v4_8(mesh, material)
                 for mesh in meshes
             )
             exact_alphaadd = (
@@ -959,7 +1976,7 @@ def enable_bounded_native_material_previews(
             continue
         meshes = user_meshes[material]
         if not meshes or any(
-            mesh.color_attributes.get("Native V4-8") is None
+            not _mesh_material_has_native_v4_8(mesh, material)
             for mesh in meshes
         ):
             continue
@@ -984,8 +2001,36 @@ def enable_bounded_native_material_previews(
             image_node=image_node,
             diagnostic=False,
         )
+        color_socket = nodes[
+            "Native Layer 0 RGB Scale"
+        ].outputs["Vector"]
+        source_alpha_socket = nodes[
+            "Native Layer 0 Alpha Scale"
+        ].outputs["Value"]
+        alpha_test_mask = _native_alpha_test_mask(
+            nodes=nodes,
+            links=links,
+            alpha_socket=source_alpha_socket,
+            layer=layer,
+        )
+        opacity_socket = source_alpha_socket
+        if alpha_test_mask is not None:
+            opacity_socket = _multiply_alpha_sockets(
+                nodes=nodes,
+                links=links,
+                left=source_alpha_socket,
+                right=alpha_test_mask,
+                name="Native Layer 0 Preview Alpha Test",
+            )
+        _connect_emission_surface(
+            material=material,
+            nodes=nodes,
+            links=links,
+            color_socket=color_socket,
+            alpha_socket=opacity_socket,
+            render_method="BLENDED",
+        )
         principled.inputs["Emission Strength"].default_value = 0.35
-        material.surface_render_method = "BLENDED"
         material["killzone_layer_images_connected_to_shader"] = True
         pixel_format = str(layer["pixel_format"])
         material["killzone_preview_mode"] = (
@@ -996,15 +2041,70 @@ def enable_bounded_native_material_previews(
         material["killzone_preview_pixel_format"] = pixel_format
         material["killzone_preview_source_over"] = True
         material["killzone_preview_ps2_color_one"] = 128
-        material["killzone_preview_emission_strength"] = 0.35
+        material["killzone_preview_emission_strength"] = 1.0
+        material["killzone_preview_alpha_test"] = int(
+            layer.get("alpha_test", 7)
+        )
+        material["killzone_preview_alpha_reference_byte"] = (
+            native_alpha_reference_byte(
+                int(layer.get("alpha_reference", 0))
+            )
+        )
+        material["killzone_shader_profile"] = "bounded-native-preview"
         material["killzone_shader_status"] = (
-            f"Bounded direct-UV {pixel_format} ALPHAADD preview with "
+            f"Unlit bounded direct-UV {pixel_format} ALPHAADD preview with "
             "Native V4-8 color/alpha modulation; full runtime lighting "
             "remains unreconstructed"
         )
         counts["alphaadd"] += 1
 
     return counts
+
+
+def _mesh_material_has_native_v4_8(
+    mesh: bpy.types.Mesh,
+    material: bpy.types.Material,
+) -> bool:
+    token = material.get("killzone_core_local_token")
+    encoded_presence = mesh.get(
+        "killzone_material_v4_8_presence_json"
+    )
+    if isinstance(token, str) and isinstance(encoded_presence, str):
+        presence = json.loads(encoded_presence)
+        if token in presence:
+            value = presence[token]
+            if type(value) is not bool:
+                raise ValueError(
+                    "Per-material Native V4-8 presence must be Boolean"
+                )
+            return value
+    return mesh.color_attributes.get("Native V4-8") is not None
+
+
+def _mesh_material_native_v4_8_alpha_range(
+    mesh: bpy.types.Mesh,
+    material: bpy.types.Material,
+) -> tuple[int, int] | None:
+    token = material.get("killzone_core_local_token")
+    encoded_ranges = mesh.get(
+        "killzone_material_v4_8_alpha_range_json"
+    )
+    if not isinstance(token, str) or not isinstance(encoded_ranges, str):
+        return None
+    ranges = json.loads(encoded_ranges)
+    raw_range = ranges.get(token)
+    if not (
+        isinstance(raw_range, list)
+        and len(raw_range) == 2
+        and all(type(value) is int for value in raw_range)
+        and 0 <= raw_range[0] <= raw_range[1] <= 0xFF
+    ):
+        if raw_range is None:
+            return None
+        raise ValueError(
+            "Per-material Native V4-8 alpha range must contain two bytes"
+        )
+    return raw_range[0], raw_range[1]
 
 
 def create_native_materials(
@@ -1123,6 +2223,8 @@ def _build_resource_mesh(
     adc_values: list[bool] = []
     triangles: list[tuple[int, int, int]] = []
     material_ids: list[int] = []
+    material_v4_8_presence: dict[int, bool] = {}
+    material_v4_8_alpha_ranges: dict[int, tuple[int, int]] = {}
     winding_corrections = 0
 
     for packet in resource.packets:
@@ -1134,6 +2236,34 @@ def _build_resource_mesh(
             coordinates.append(vertex.coordinates)
             adc_values.append(vertex.adc)
         material_id = resource.records[packet.mesh_record_index].material_id
+        packet_colors = tuple(
+            vertex.color
+            for vertex in packet.vertices
+            if vertex.color is not None
+        )
+        packet_has_v4_8 = len(packet_colors) == len(packet.vertices)
+        if material_id in material_v4_8_presence:
+            material_v4_8_presence[material_id] = (
+                material_v4_8_presence[material_id]
+                and packet_has_v4_8
+            )
+        else:
+            material_v4_8_presence[material_id] = packet_has_v4_8
+        if packet_colors:
+            packet_alpha_min = min(color[3] for color in packet_colors)
+            packet_alpha_max = max(color[3] for color in packet_colors)
+            previous_range = material_v4_8_alpha_ranges.get(material_id)
+            material_v4_8_alpha_ranges[material_id] = (
+                (
+                    packet_alpha_min,
+                    packet_alpha_max,
+                )
+                if previous_range is None
+                else (
+                    min(previous_range[0], packet_alpha_min),
+                    max(previous_range[1], packet_alpha_max),
+                )
+            )
         for packet_triangle in packet.triangles:
             triangle = tuple(base + index for index in packet_triangle)
             corrected, changed = _corrected_triangle(
@@ -1169,7 +2299,7 @@ def _build_resource_mesh(
         for loop in mesh.loops:
             vertex_coordinates = coordinates[loop.vertex_index]
             uv_layer.data[loop.index].uv = (
-                vertex_coordinates[uv_index]
+                native_uv_to_blender(vertex_coordinates[uv_index])
                 if uv_index < len(vertex_coordinates)
                 else (0.0, 0.0)
             )
@@ -1201,6 +2331,24 @@ def _build_resource_mesh(
     )
     for index, value in enumerate(material_ids):
         material_attribute.data[index].value = value
+    mesh["killzone_material_v4_8_presence_json"] = json.dumps(
+        {
+            f"0x{material_id:08X}": present
+            for material_id, present in sorted(
+                material_v4_8_presence.items()
+            )
+        },
+        separators=(",", ":"),
+    )
+    mesh["killzone_material_v4_8_alpha_range_json"] = json.dumps(
+        {
+            f"0x{material_id:08X}": list(alpha_range)
+            for material_id, alpha_range in sorted(
+                material_v4_8_alpha_ranges.items()
+            )
+        },
+        separators=(",", ":"),
+    )
 
     mesh["killzone_object_id"] = f"0x{node.object_id:08X}"
     mesh["killzone_section_offset"] = node.key.section_offset
@@ -1251,6 +2399,9 @@ def import_native_level_data(
     direct_collection = bpy.data.collections.new("Direct World (identity)")
     props_collection = bpy.data.collections.new("Props")
     instance_collection = bpy.data.collections.new("Static Instances")
+    collision_instance_collection = bpy.data.collections.new(
+        "Collision Mesh Instances"
+    )
     animated_instance_collection = bpy.data.collections.new(
         "Animated Skinned Instances (metadata only)"
     )
@@ -1258,7 +2409,14 @@ def import_native_level_data(
     root_collection.children.link(direct_collection)
     root_collection.children.link(props_collection)
     props_collection.children.link(instance_collection)
+    props_collection.children.link(collision_instance_collection)
     props_collection.children.link(animated_instance_collection)
+    set_native_import_provenance(
+        root_collection,
+        product="native-map-placement",
+        operator="kz.import_map",
+        level_placement_context_loaded=True,
+    )
 
     root_collection["killzone_source_path"] = level_path
     root_collection["killzone_core_sha256"] = level.source_core_sha256
@@ -1284,11 +2442,56 @@ def import_native_level_data(
         level.render_plan.instance_triangle_count
     )
     root_collection["killzone_static_prop_count"] = len(level.instances)
+    root_collection["killzone_serialized_static_instance_count"] = len(
+        level.instances
+    )
+    root_collection[
+        "killzone_selected_static_instance_leaf_occurrence_count"
+    ] = sum(
+        occurrence.path == "instance"
+        for occurrence in level.render_plan.instance_occurrences
+    )
+    root_collection["killzone_distinct_static_instance_matrix_count"] = len(
+        {
+            struct.pack("<16f", *instance.matrix)
+            for instance in level.instances
+        }
+    )
+    root_collection["killzone_origin_static_instance_count"] = sum(
+        instance.matrix[12:15] == (0.0, 0.0, 0.0)
+        for instance in level.instances
+    )
+    root_collection["killzone_collision_mesh_prop_count"] = len(
+        level.collision_instances
+    )
+    root_collection["killzone_serialized_collision_mesh_instance_count"] = (
+        len(level.collision_instances)
+    )
+    root_collection[
+        "killzone_selected_collision_mesh_leaf_occurrence_count"
+    ] = sum(
+        occurrence.path == "collision-instance"
+        for occurrence in level.render_plan.instance_occurrences
+    )
+    root_collection[
+        "killzone_distinct_collision_mesh_instance_matrix_count"
+    ] = len(
+        {
+            struct.pack("<16f", *instance.matrix)
+            for instance in level.collision_instances
+        }
+    )
+    root_collection["killzone_origin_collision_mesh_instance_count"] = sum(
+        instance.matrix[12:15] == (0.0, 0.0, 0.0)
+        for instance in level.collision_instances
+    )
     root_collection["killzone_animated_prop_count"] = len(
         level.skinned_instances
     )
     root_collection["killzone_prop_count"] = (
-        len(level.instances) + len(level.skinned_instances)
+        len(level.instances)
+        + len(level.collision_instances)
+        + len(level.skinned_instances)
     )
     root_collection["killzone_null_static_prop_count"] = sum(
         instance.resource_key is None for instance in level.instances
@@ -1323,6 +2526,7 @@ def import_native_level_data(
     winding_corrections = 0
     objects: list[bpy.types.Object] = []
     static_instance_objects: list[bpy.types.Object] = []
+    collision_instance_objects: list[bpy.types.Object] = []
     animated_instance_objects: list[bpy.types.Object] = []
 
     def mesh_for(
@@ -1375,7 +2579,9 @@ def import_native_level_data(
         start=direct_count,
     ):
         if occurrence.instance_key is None:
-            raise ValueError("Static instance occurrence has no instance key")
+            raise ValueError(
+                "Authored visual occurrence has no instance key"
+            )
         occurrences_by_instance.setdefault(
             occurrence.instance_key, []
         ).append((index, occurrence))
@@ -1499,9 +2705,124 @@ def import_native_level_data(
             instance_collection.objects.link(obj)
             objects.append(obj)
 
+    for instance in level.collision_instances:
+        instance_occurrences = occurrences_by_instance.pop(
+            instance.key, []
+        )
+        resource = resources_by_key[instance.resource_key]
+        if len(instance_occurrences) == 1:
+            occurrence_index, occurrence = instance_occurrences[0]
+            node = resources_by_key[occurrence.leaf_key]
+            owner = bpy.data.objects.new(
+                instance.name
+                or f"Collision Prop 0x{instance.object_id:08X}",
+                mesh_for(node),
+            )
+            collision_instance_collection.objects.link(owner)
+            owner.matrix_world = _object_matrix(instance.matrix)
+            owner.color = _object_color(occurrence, node.object_id)
+            owner["killzone_path"] = "collision-instance"
+            owner["killzone_render_role"] = (
+                "authored-single-leaf-collision-mesh-occurrence"
+            )
+            _set_instance_source_properties(
+                owner,
+                instance,
+                serialized_type="CollisionMeshInstance",
+            )
+            _set_collision_instance_properties(owner, instance)
+            owner["killzone_resource_status"] = "resolved"
+            owner["killzone_resource_kind"] = resource.kind
+            _set_reference_key_properties(
+                owner,
+                "killzone_resource",
+                resource.key,
+            )
+            owner["killzone_selected_leaf_count"] = 1
+            owner["killzone_leaf_object_id"] = (
+                f"0x{node.object_id:08X}"
+            )
+            owner["killzone_leaf_section_offset"] = (
+                node.key.section_offset
+            )
+            owner["killzone_leaf_object_index"] = node.key.object_index
+            owner["killzone_source_section_offset"] = (
+                occurrence.source_key.section_offset
+            )
+            owner["killzone_source_object_index"] = (
+                occurrence.source_key.object_index
+            )
+            owner["killzone_render_occurrence_index"] = occurrence_index
+            collision_instance_objects.append(owner)
+            objects.append(owner)
+            continue
+
+        if not instance_occurrences:
+            raise ValueError(
+                "Collision mesh instance has no render occurrence"
+            )
+        owner = bpy.data.objects.new(
+            instance.name
+            or f"Collision Prop 0x{instance.object_id:08X}",
+            None,
+        )
+        owner.empty_display_type = "PLAIN_AXES"
+        collision_instance_collection.objects.link(owner)
+        owner.matrix_world = _object_matrix(instance.matrix)
+        owner["killzone_path"] = "collision-instance-owner"
+        _set_instance_source_properties(
+            owner,
+            instance,
+            serialized_type="CollisionMeshInstance",
+        )
+        _set_collision_instance_properties(owner, instance)
+        owner["killzone_resource_status"] = "resolved"
+        owner["killzone_resource_kind"] = resource.kind
+        _set_reference_key_properties(
+            owner,
+            "killzone_resource",
+            resource.key,
+        )
+        owner["killzone_selected_leaf_count"] = len(instance_occurrences)
+        collision_instance_objects.append(owner)
+
+        for occurrence_index, occurrence in instance_occurrences:
+            node = resources_by_key[occurrence.leaf_key]
+            obj = bpy.data.objects.new(
+                f"Collision Instance {occurrence_index:04d} "
+                f"0x{node.object_id:08X}",
+                mesh_for(node),
+            )
+            obj.parent = owner
+            obj.matrix_parent_inverse = Matrix.Identity(4)
+            obj.matrix_world = owner.matrix_world.copy()
+            obj.color = _object_color(occurrence, node.object_id)
+            obj["killzone_path"] = "collision-instance"
+            obj["killzone_occurrence_kind"] = (
+                "collision-mesh-instance-leaf"
+            )
+            obj["killzone_explicit_instance"] = True
+            obj["killzone_leaf_object_id"] = f"0x{node.object_id:08X}"
+            obj["killzone_leaf_section_offset"] = node.key.section_offset
+            obj["killzone_leaf_object_index"] = node.key.object_index
+            obj["killzone_source_section_offset"] = (
+                occurrence.source_key.section_offset
+            )
+            obj["killzone_source_object_index"] = (
+                occurrence.source_key.object_index
+            )
+            obj["killzone_instance_section_offset"] = (
+                instance.key.section_offset
+            )
+            obj["killzone_instance_object_index"] = (
+                instance.key.object_index
+            )
+            collision_instance_collection.objects.link(obj)
+            objects.append(obj)
+
     if occurrences_by_instance:
         raise ValueError(
-            "Static render plan references unknown instance keys"
+            "Static render plan references unknown visual instance keys"
         )
 
     for instance in level.skinned_instances:
@@ -1552,6 +2873,18 @@ def import_native_level_data(
         animated_instance_collection.objects.link(owner)
         animated_instance_objects.append(owner)
 
+    if len(static_instance_objects) != len(level.instances):
+        raise ValueError(
+            "Blender static occurrence-owner count disagrees with source"
+        )
+    if len(collision_instance_objects) != len(
+        level.collision_instances
+    ):
+        raise ValueError(
+            "Blender collision-mesh occurrence-owner count disagrees "
+            "with source"
+        )
+
     preview_counts = enable_bounded_native_material_previews(
         materials_by_token.values(),
         objects,
@@ -1559,10 +2892,22 @@ def import_native_level_data(
         include_color_diagnostics=import_textures,
     )
     root_collection["killzone_unique_leaf_mesh_count"] = len(mesh_cache)
+    root_collection["killzone_static_instance_owner_count"] = len(
+        static_instance_objects
+    )
+    root_collection["killzone_collision_mesh_instance_owner_count"] = len(
+        collision_instance_objects
+    )
     root_collection["killzone_winding_corrections"] = winding_corrections
     root_collection["killzone_decoded_image_count"] = len(images_by_token)
     root_collection["killzone_bounded_alphaadd_preview_count"] = (
         preview_counts["alphaadd"]
+    )
+    root_collection["killzone_bounded_layerbumpdot3_preview_count"] = (
+        preview_counts.get("layerbumpdot3", 0)
+    )
+    root_collection["killzone_maskedwrite_foliage_preview_count"] = (
+        preview_counts.get("maskedwrite", 0)
     )
     root_collection["killzone_write_preview_count"] = preview_counts["write"]
     root_collection["killzone_color_diagnostic_preview_count"] = (
@@ -1577,9 +2922,11 @@ def import_native_level_data(
         direct_collection=direct_collection,
         props_collection=props_collection,
         instance_collection=instance_collection,
+        collision_instance_collection=collision_instance_collection,
         animated_instance_collection=animated_instance_collection,
         objects=tuple(objects),
         static_instance_objects=tuple(static_instance_objects),
+        collision_instance_objects=tuple(collision_instance_objects),
         animated_instance_objects=tuple(animated_instance_objects),
         unique_mesh_count=len(mesh_cache),
         winding_corrections=winding_corrections,

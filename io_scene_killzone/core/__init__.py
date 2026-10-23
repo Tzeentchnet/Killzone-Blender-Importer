@@ -169,6 +169,7 @@ from .native_static_model import (
     parse_native_static_model,
 )
 from .native_level import (
+    NativeCollisionMeshInstance,
     NativeCoreObject,
     NativeCoreSection,
     NativeLevel,
@@ -185,6 +186,7 @@ from .native_level import (
     load_native_level,
     native_static_resource_roots,
     parse_native_core_sections,
+    parse_native_collision_mesh_instances,
     parse_native_level,
     parse_native_level_instances,
     parse_native_level_sections,
@@ -256,6 +258,7 @@ __all__ = [
     "DecodedNativeStaticMeshRecord",
     "DecodedNativeStaticPacket",
     "NativeStaticVertex",
+    "NativeCollisionMeshInstance",
     "NativeCoreObject",
     "NativeCoreSection",
     "NativeLevel",
@@ -346,6 +349,7 @@ __all__ = [
     "load_native_skinned_model",
     "pack_decal_sort_descriptor",
     "parse_native_core_sections",
+    "parse_native_collision_mesh_instances",
     "parse_native_decal_library",
     "parse_native_level",
     "parse_native_level_instances",

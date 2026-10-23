@@ -47,16 +47,27 @@ _SKINNED_RESOURCE_TYPES = {
     "LodSkinnedMeshResource",
     "SkinnedBlendShapeResource",
 }
-_EXPANDED_TYPES = _STATIC_RESOURCE_TYPES | _SKINNED_RESOURCE_TYPES | {
-    "DecalResource",
-    "Texture",
-    "AnimatedTexture",
-    "Material",
-    "Skeleton",
-    "SkeletonAnimationResource",
+_COLLISION_RESOURCE_TYPES = {
+    "CollisionResourceBox",
+    "CollisionResourcePolySoup",
+    "CollisionMultiResource",
 }
+_EXPANDED_TYPES = (
+    _STATIC_RESOURCE_TYPES
+    | _SKINNED_RESOURCE_TYPES
+    | _COLLISION_RESOURCE_TYPES
+    | {
+        "DecalResource",
+        "Texture",
+        "AnimatedTexture",
+        "Material",
+        "Skeleton",
+        "SkeletonAnimationResource",
+    }
+)
 _BONE_MAP_TYPES = {"SkeletonAnimationBoneMap"}
 _COMPACT_TYPES = {
+    "CollisionMeshInstance",
     "ProximitySensorInstance",
     "SimpleAnimatingSkinnedMeshInstance",
     "StaticMeshInstance",
@@ -143,6 +154,43 @@ class NativeStaticInstance:
 
 
 @dataclass(frozen=True, slots=True)
+class NativeCollisionMeshInstance:
+    key: NativeObjectKey
+    object_id: int
+    name: str
+    name_index: int
+    name_is_identifier: bool
+    collision_group: int
+    parent_token: int
+    collision_enabled: bool
+    collision_resource_token: int
+    collision_resource_key: NativeObjectKey
+    collision_resource_type: str
+    resource_token: int
+    resource_key: NativeObjectKey
+    matrix: tuple[float, ...]
+    footer: int
+    raw_blob: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class _SerializedCollisionMeshInstance:
+    key: NativeObjectKey
+    object_id: int
+    name: str
+    name_index: int
+    name_is_identifier: bool
+    collision_group: int
+    parent_token: int
+    collision_enabled: bool
+    collision_resource_token: int
+    resource_token: int
+    matrix: tuple[float, ...]
+    footer: int
+    raw_blob: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class NativeSimpleSkinnedInstance:
     key: NativeObjectKey
     object_id: int
@@ -205,6 +253,7 @@ class NativeLevel:
     sections: tuple[NativeCoreSection, ...]
     resources: tuple[NativeStaticResourceNode, ...]
     instances: tuple[NativeStaticInstance, ...]
+    collision_instances: tuple[NativeCollisionMeshInstance, ...]
     skinned_instances: tuple[NativeSimpleSkinnedInstance, ...]
     render_plan: NativeStaticRenderPlan
     textures: tuple[NativeLevelTexture, ...]
@@ -822,6 +871,84 @@ def _parse_static_instance(
     )
 
 
+def _parse_collision_mesh_instance(
+    obj: NativeCoreObject,
+    header: CoreHeader,
+) -> _SerializedCollisionMeshInstance:
+    blob = obj.blob
+    if len(blob) != 0x70:
+        raise CoreFormatError(
+            f"CollisionMeshInstance blob size is 0x{len(blob):X}, "
+            "expected 0x70"
+        )
+    (
+        name_index,
+        collision_group,
+        parent_token,
+        collision_resource_token,
+    ) = struct.unpack_from("<4I", blob, 0)
+    collision_enabled = blob[0x10]
+    name_flag = blob[0x11]
+    if name_index >= len(header.strings):
+        raise CoreFormatError("CollisionMeshInstance name index is invalid")
+    if collision_enabled not in (0, 1):
+        raise CoreFormatError(
+            "CollisionMeshInstance enabled flag is not boolean"
+        )
+    if name_flag not in (0, 1):
+        raise CoreFormatError(
+            "CollisionMeshInstance name flag is not boolean"
+        )
+    if any(blob[0x12:0x14]):
+        raise CoreFormatError(
+            "CollisionMeshInstance flag padding is non-zero"
+        )
+    if parent_token != 0:
+        raise CoreFormatError(
+            "CollisionMeshInstance parent token is not null"
+        )
+    if collision_resource_token == 0:
+        raise CoreFormatError(
+            "CollisionMeshInstance collision resource token is null"
+        )
+    matrix = _parse_affine_matrix(
+        blob,
+        offset=0x14,
+        type_name="CollisionMeshInstance",
+    )
+    resource_token, zero_a, zero_b, footer = struct.unpack_from(
+        "<4I", blob, 0x54
+    )
+    if resource_token == 0:
+        raise CoreFormatError(
+            "CollisionMeshInstance mesh resource token is null"
+        )
+    if zero_a != 0 or zero_b != 0 or any(blob[0x64:0x70]):
+        raise CoreFormatError(
+            "CollisionMeshInstance trailer is non-zero"
+        )
+    name = header.strings[name_index].utf8
+    if name is None:
+        raise CoreFormatError(
+            "CollisionMeshInstance name is not UTF-8"
+        )
+    return _SerializedCollisionMeshInstance(
+        key=obj.key,
+        object_id=obj.object_id,
+        name=name,
+        name_index=name_index,
+        name_is_identifier=bool(name_flag),
+        collision_group=collision_group,
+        parent_token=parent_token,
+        collision_enabled=bool(collision_enabled),
+        collision_resource_token=collision_resource_token,
+        resource_token=resource_token,
+        matrix=matrix,
+        footer=footer,
+        raw_blob=blob,
+    )
+
+
 def _parse_simple_skinned_instance(
     obj: NativeCoreObject,
     header: CoreHeader,
@@ -902,6 +1029,53 @@ def _resolve_core_object_token(
             f"objects of expected type {expected}"
         )
     return matches[0]
+
+
+def parse_native_collision_mesh_instances(
+    header: CoreHeader,
+    objects: tuple[NativeCoreObject, ...],
+    resources: tuple[NativeStaticResourceNode, ...],
+) -> tuple[NativeCollisionMeshInstance, ...]:
+    parsed = tuple(
+        _parse_collision_mesh_instance(obj, header)
+        for obj in objects
+        if obj.type_name == "CollisionMeshInstance"
+    )
+    instances: list[NativeCollisionMeshInstance] = []
+    for instance in parsed:
+        collision_resource = _resolve_core_object_token(
+            instance.collision_resource_token,
+            objects,
+            _COLLISION_RESOURCE_TYPES,
+            "CollisionMeshInstance collision resource",
+        )
+        mesh_resource = _resolve_resource_token(
+            instance.resource_token,
+            resources,
+        )
+        instances.append(
+            NativeCollisionMeshInstance(
+                key=instance.key,
+                object_id=instance.object_id,
+                name=instance.name,
+                name_index=instance.name_index,
+                name_is_identifier=instance.name_is_identifier,
+                collision_group=instance.collision_group,
+                parent_token=instance.parent_token,
+                collision_enabled=instance.collision_enabled,
+                collision_resource_token=(
+                    instance.collision_resource_token
+                ),
+                collision_resource_key=collision_resource.key,
+                collision_resource_type=collision_resource.type_name,
+                resource_token=instance.resource_token,
+                resource_key=mesh_resource.key,
+                matrix=instance.matrix,
+                footer=instance.footer,
+                raw_blob=instance.raw_blob,
+            )
+        )
+    return tuple(instances)
 
 
 def parse_native_level_instances(
@@ -1067,6 +1241,7 @@ def expand_native_static_resource(
 def build_static_render_plan(
     resources: tuple[NativeStaticResourceNode, ...],
     instances: tuple[NativeStaticInstance, ...],
+    collision_instances: tuple[NativeCollisionMeshInstance, ...] = (),
 ) -> NativeStaticRenderPlan:
     nodes_by_key = {node.key: node for node in resources}
     if len(nodes_by_key) != len(resources):
@@ -1091,6 +1266,20 @@ def build_static_render_plan(
                     instance_key=instance.key,
                     matrix=instance.matrix,
                     path="instance",
+                )
+            )
+    for instance in collision_instances:
+        instance_target_keys.add(instance.resource_key)
+        for leaf_key in _expand_resource(
+            instance.resource_key, nodes_by_key, memo, set()
+        ):
+            instance_occurrences.append(
+                NativeStaticOccurrence(
+                    leaf_key=leaf_key,
+                    source_key=instance.resource_key,
+                    instance_key=instance.key,
+                    matrix=instance.matrix,
+                    path="collision-instance",
                 )
             )
 
@@ -1235,8 +1424,17 @@ def parse_native_level(
         objects,
         resources,
     )
+    collision_instances = parse_native_collision_mesh_instances(
+        header,
+        objects,
+        resources,
+    )
 
-    render_plan = build_static_render_plan(resources, instances)
+    render_plan = build_static_render_plan(
+        resources,
+        instances,
+        collision_instances,
+    )
     direct_material_tokens = _occurrence_material_tokens(
         render_plan.direct_occurrences, resources
     )
@@ -1286,6 +1484,7 @@ def parse_native_level(
         sections=sections,
         resources=resources,
         instances=instances,
+        collision_instances=collision_instances,
         skinned_instances=skinned_instances,
         render_plan=render_plan,
         textures=textures,

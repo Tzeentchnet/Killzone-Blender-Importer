@@ -240,7 +240,7 @@ def _report(
         for layer in material.layers
     )
     return {
-        "report_version": 5,
+        "report_version": 6,
         "level_path": level_path,
         "source_core_sha256": level.source_core_sha256,
         "source_corestream_sha256": level.source_corestream_sha256,
@@ -264,6 +264,7 @@ def _report(
             node.kind == "lod" for node in level.resources
         ),
         "static_instances": len(level.instances),
+        "collision_mesh_instances": len(level.collision_instances),
         "physical_textures": len(level.textures),
         "logical_textures": len(level.logical_textures),
         "texture_payload_bytes": sum(
@@ -317,6 +318,14 @@ def _report(
         "direct_world_roots": len(plan.direct_roots),
         "direct_leaf_occurrences": len(plan.direct_occurrences),
         "instance_leaf_occurrences": len(plan.instance_occurrences),
+        "static_instance_leaf_occurrences": sum(
+            occurrence.path == "instance"
+            for occurrence in plan.instance_occurrences
+        ),
+        "collision_instance_leaf_occurrences": sum(
+            occurrence.path == "collision-instance"
+            for occurrence in plan.instance_occurrences
+        ),
         "direct_packets": plan.direct_packet_count,
         "direct_triangles": plan.direct_triangle_count,
         "instance_packets": plan.instance_packet_count,
@@ -325,11 +334,17 @@ def _report(
             plan.direct_triangle_count + plan.instance_triangle_count
         ),
         "serialized_static_props": len(level.instances),
+        "serialized_collision_mesh_props": len(
+            level.collision_instances
+        ),
         "serialized_animated_props": len(level.skinned_instances),
         "blender_objects": len(result.objects),
         "blender_mesh_objects": len(result.objects),
         "blender_static_prop_owners": len(
             result.static_instance_objects
+        ),
+        "blender_collision_mesh_prop_owners": len(
+            result.collision_instance_objects
         ),
         "blender_animated_prop_owners": len(
             result.animated_instance_objects
@@ -510,7 +525,23 @@ def _texture_investigation(
             route_status = str(
                 document.get("coordinate_route_status", "missing")
             )
-            if layer.index == preview_layer_index and preview_mode:
+            if (
+                preview_mode
+                == "two-layer-alphaadd-layerbumpdot3"
+                and layer.index in (0, 1)
+            ):
+                render_status = (
+                    "resolved-bounded-alphaadd-layerbumpdot3-composition"
+                )
+            elif (
+                preview_mode
+                == "two-layer-maskedwrite-alphaadd-cutout"
+                and layer.index in (0, 1)
+            ):
+                render_status = (
+                    "diagnostic-maskedwrite-alphaadd-cutout-preview"
+                )
+            elif layer.index == preview_layer_index and preview_mode:
                 if str(preview_mode).startswith("single-layer-index"):
                     render_status = "bounded-alphaadd-preview"
                 elif preview_mode == "layer0-write":
@@ -545,6 +576,37 @@ def _texture_investigation(
                 if render_status == "inspection-only-final-shader-unconnected":
                     reasons.append(
                         "native-material-composition-unreconstructed"
+                    )
+                elif render_status == (
+                    "resolved-bounded-alphaadd-"
+                    "layerbumpdot3-composition"
+                ):
+                    reasons.extend(
+                        (
+                            "framebuffer-history-before-layer0-"
+                            "not-representable",
+                            "gs-byte-quantization-and-final-clamp-"
+                            "host-approximated",
+                        )
+                    )
+                    if layer.lighting_mode == 1:
+                        reasons.append(
+                            "complete-native-vu-lighting-before-layer0-"
+                            "host-approximated"
+                        )
+                elif render_status == (
+                    "diagnostic-maskedwrite-alphaadd-cutout-preview"
+                ):
+                    reasons.extend(
+                        (
+                            "strict-decoded-alpha-greater-than-204-"
+                            "diagnostic",
+                            "layer0-maskedwrite-additive-rgb-and-depth-"
+                            "effects-omitted",
+                            "layer1-alphaadd-low-alpha-fringe-omitted",
+                            "per-pass-tfx-vu-framebuffer-state-"
+                            "unreconstructed",
+                        )
                     )
                 elif render_status == "diagnostic-write-preview":
                     reasons.append(
@@ -804,8 +866,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     report["overview_png"] = str(overview_path)
     if material_path is not None:
         subtitle.data.body = (
-            "WRITE + V4-8 ALPHAADD + COLOR-LAYER DIAGNOSTICS; "
-            "NOT NATIVE MULTI-LAYER SHADING"
+            "BOUNDED ALPHAADD + LAYERBUMPDOT3; MASKEDWRITE FOLIAGE; "
+            "WRITE / V4-8 / COLOR-LAYER DIAGNOSTICS"
         )
         preview_counts = enable_bounded_native_material_previews(
             (

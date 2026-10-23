@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping
 
 import bpy
 
+from . import ADDON_VERSION
 from .core.bundle import (
     Bundle,
     MaterialSpec,
@@ -28,7 +29,7 @@ from .core.mesh_format import (
     serialize_mesh,
 )
 
-_ADDON_VERSION = "0.10.2"
+_ADDON_VERSION = ".".join(str(component) for component in ADDON_VERSION)
 _VERTEX_KEY = struct.Struct("<3f3f2f4B")
 _DEFAULT_MATERIAL = MaterialSpec(name="Default", properties={})
 

@@ -142,6 +142,56 @@ class NativeAnimationBinding:
         )
 
 
+def infer_native_animation_name(
+    clip: NativeAnimationClip,
+    skeleton: NativeSkeleton,
+    binding: NativeAnimationBinding,
+    library: NativeAnimationLibrary,
+) -> str | None:
+    if (
+        len(library.clips) != 1
+        or library.clips[0].key != clip.key
+        or binding.clip_key != clip.key
+        or binding.clip_object_id != clip.object_id
+        or binding.skeleton_object_id != skeleton.object_id
+    ):
+        return None
+    name_index = skeleton.name_string_index
+    if not 0 <= name_index < len(library.header.strings):
+        return None
+    skeleton_name = library.header.strings[name_index].utf8
+    prefix = "skelet_"
+    if (
+        skeleton_name is None
+        or not skeleton_name.casefold().startswith(prefix)
+    ):
+        return None
+    candidate = skeleton_name[len(prefix) :]
+    if not candidate:
+        return None
+    root_indices = tuple(
+        bone.index
+        for bone in skeleton.bones
+        if bone.parent_index is None
+    )
+    if len(root_indices) != 1:
+        return None
+    root_tracks = tuple(
+        track.track_name
+        for track in binding.tracks
+        if track.bone_index == root_indices[0]
+    )
+    suffix = "_joint"
+    if (
+        len(root_tracks) != 1
+        or not root_tracks[0].casefold().endswith(suffix)
+        or root_tracks[0][: -len(suffix)].casefold()
+        != candidate.casefold()
+    ):
+        return None
+    return candidate
+
+
 @dataclass(frozen=True, slots=True)
 class NativeAnimationBonePose:
     bone_index: int

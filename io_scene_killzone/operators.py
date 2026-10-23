@@ -24,7 +24,6 @@ from .core.native_asset_catalog import (
     NativeCachedAnimationBank,
     NativeCachedMap,
     NativeCachedModel,
-    NativeCachedTexture,
     scan_native_asset_catalog,
 )
 from .core.native_level import NativeObjectKey
@@ -38,7 +37,6 @@ from .native_animation_io import (
 from .native_level_io import import_native_level
 from .native_skinned_io import import_native_skinned_model
 from .native_static_io import import_native_static_model
-from .native_texture_io import import_native_texture
 
 
 _ADDON_ID = __package__
@@ -47,6 +45,38 @@ _NO_BANK = "NONE"
 _cached_json = ""
 _cached_catalog: NativeAssetCatalog | None = None
 _enum_items: dict[str, list[tuple[str, str, str]]] = {}
+_ANIMATION_WRITER_ITEMS = (
+    (
+        ANIMATION_WRITER_BULK,
+        "Optimized Bulk FCurves",
+        "Create layered FCurves with vectorized keyframes and exact "
+        "constant-channel reduction",
+    ),
+    (
+        ANIMATION_WRITER_LEGACY,
+        "Legacy Keyframe Insert",
+        "Use the original known-working per-bone keyframe_insert writer",
+    ),
+)
+_THIRD_PERSON_CHARACTER_PREFIXES = (
+    "entity.helghast.3rd.",
+    "entity.isa.3rd.",
+    "entity.player.3rd.",
+)
+_THIRD_PERSON_NON_CHARACTER_TERMS = (
+    "apc",
+    "boat",
+    "craft",
+    "cupola",
+    "dropship",
+    "emplaced",
+    "gun",
+    "hovertank",
+    "jetbike",
+    "mrl",
+    "sentrybot",
+    "turret",
+)
 
 
 def _invalidate_runtime_cache() -> None:
@@ -164,20 +194,6 @@ def _model_items(
     )
 
 
-def _texture_items(
-    _self: object,
-    context: bpy.types.Context,
-) -> list[tuple[str, str, str]]:
-    catalog = _safe_current_catalog(context)
-    values = () if catalog is None else catalog.textures
-    return _cached_items(
-        "textures",
-        values,
-        lambda value: value.display_name,
-        lambda value: value.path,
-    )
-
-
 def _animation_bank_items(
     _self: object,
     context: bpy.types.Context,
@@ -197,13 +213,48 @@ def _animation_bank_items(
         cached.extend(
             (
                 f"bank:{index}",
-                value.display_name,
+                f"{Path(value.path).name} - {value.display_name}",
                 value.path,
             )
             for index, value in enumerate(values)
         )
         _enum_items[key] = cached
     return cached
+
+
+def _animation_bank_selection_label(
+    scene: bpy.types.Scene,
+    catalog: NativeAssetCatalog,
+) -> str:
+    identifier = scene.kz_additional_animation_bank
+    if identifier == _NO_BANK:
+        return "Selected: None (model Core only)"
+    if not identifier.startswith("bank:"):
+        return "Selected bank is invalid; rescan the ISO"
+    try:
+        index = int(identifier.removeprefix("bank:"))
+    except ValueError:
+        return "Selected bank is invalid; rescan the ISO"
+    if not 0 <= index < len(catalog.animation_banks):
+        return "Selected bank is stale; rescan the ISO"
+    bank = catalog.animation_banks[index]
+    return (
+        f"Selected: {Path(bank.path).name} "
+        f"({bank.clip_count:,} clips)"
+    )
+
+
+def _should_suggest_allweapons(model: NativeCachedModel) -> bool:
+    file_name = Path(model.path).name.casefold()
+    return (
+        model.kind == "skinned"
+        and model.own_animation_count == 0
+        and file_name.startswith(_THIRD_PERSON_CHARACTER_PREFIXES)
+        and not any(
+            term in file_name
+            for term in _THIRD_PERSON_NON_CHARACTER_TERMS
+        )
+    )
 
 
 def _selected_index(identifier: str, count: int, label: str) -> int:
@@ -248,20 +299,6 @@ def _selected_model(
         "model",
     )
     return catalog.models[index]
-
-
-def _selected_texture(
-    context: bpy.types.Context,
-) -> NativeCachedTexture:
-    catalog = _current_catalog(context)
-    if catalog is None:
-        raise CoreFormatError("Scan the configured ISO before importing")
-    index = _selected_index(
-        context.scene.kz_texture_asset,
-        len(catalog.textures),
-        "texture",
-    )
-    return catalog.textures[index]
 
 
 def _animation_banks_for_scene(
@@ -395,7 +432,6 @@ def _reset_scene_selections(catalog: NativeAssetCatalog) -> None:
     selections = (
         ("kz_map_asset", bool(catalog.maps)),
         ("kz_model_asset", bool(catalog.models)),
-        ("kz_texture_asset", bool(catalog.textures)),
     )
     for scene in bpy.data.scenes:
         for property_name, has_items in selections:
@@ -441,6 +477,31 @@ class KZ_UL_animation_clips(bpy.types.UIList):
 class KZ_AddonPreferences(bpy.types.AddonPreferences):
     bl_idname = _ADDON_ID
 
+    animation_writer: EnumProperty(
+        name="Action Writer",
+        description="Blender Action writing strategy",
+        items=_ANIMATION_WRITER_ITEMS,
+        default=ANIMATION_WRITER_BULK,
+    )
+    animation_fallback_to_legacy: BoolProperty(
+        name="Retry with Legacy Writer on Failure",
+        description=(
+            "Retry a clip with the known-working keyframe_insert writer if "
+            "the optimized Blender Action writer fails"
+        ),
+        default=True,
+    )
+    animation_residual_tolerance: FloatProperty(
+        name="Animation Tolerance",
+        description=(
+            "Maximum matrix decomposition residual allowed when converting "
+            "native animation to Blender channels"
+        ),
+        default=0.05,
+        min=1.0e-5,
+        soft_max=0.1,
+        precision=5,
+    )
     archive_source: StringProperty(
         name="Killzone ISO / DAT Directory",
         description="Authorized Killzone ISO or extracted DAT directory",
@@ -461,6 +522,12 @@ class KZ_AddonPreferences(bpy.types.AddonPreferences):
             text="Scan / Rescan Importable Assets",
             icon="FILE_REFRESH",
         )
+        animation_box = layout.box()
+        animation_box.label(text="Animation Import", icon="ACTION")
+        animation_box.prop(self, "animation_writer")
+        if self.animation_writer == ANIMATION_WRITER_BULK:
+            animation_box.prop(self, "animation_fallback_to_legacy")
+        animation_box.prop(self, "animation_residual_tolerance")
         if not self.asset_cache_json:
             layout.label(
                 text="Choose an ISO or DAT directory, then scan once.",
@@ -565,6 +632,60 @@ class KZ_OT_open_preferences(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class KZ_OT_select_animation_bank(bpy.types.Operator):
+    """Search the cached animation banks and select one for model import"""
+
+    bl_idname = "kz.select_animation_bank"
+    bl_label = "Select Additional Animation Bank"
+    bl_property = "bank"
+    bl_options = {"REGISTER"}
+
+    bank: EnumProperty(
+        name="Animation Bank",
+        description="Cached shared animation bank to bake with the model",
+        items=_animation_bank_items,
+    )
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        catalog = _safe_current_catalog(context)
+        return catalog is not None and bool(catalog.animation_banks)
+
+    def invoke(
+        self,
+        context: bpy.types.Context,
+        _event: bpy.types.Event,
+    ) -> set[str]:
+        identifiers = {
+            identifier
+            for identifier, _label, _description in _animation_bank_items(
+                self,
+                context,
+            )
+        }
+        current = context.scene.kz_additional_animation_bank
+        self.bank = current if current in identifiers else _NO_BANK
+        context.window_manager.invoke_search_popup(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        identifiers = {
+            identifier
+            for identifier, _label, _description in _animation_bank_items(
+                self,
+                context,
+            )
+        }
+        if self.bank not in identifiers:
+            self.report(
+                {"ERROR"},
+                "Animation-bank selection is stale; rescan the ISO",
+            )
+            return {"CANCELLED"}
+        context.scene.kz_additional_animation_bank = self.bank
+        return {"FINISHED"}
+
+
 class KZ_OT_set_animation_clip_selection(bpy.types.Operator):
     """Select or clear every cached animation clip"""
 
@@ -626,10 +747,19 @@ class KZ_OT_import_map(bpy.types.Operator):
             if context.scene.kz_import_map_textures
             else "geometry only"
         )
+        visual_prop_count = (
+            len(result.static_instance_objects)
+            + len(result.collision_instance_objects)
+        )
         self.report(
             {"INFO"},
             f"Imported {asset.display_name}: {total_triangles:,} triangles, "
-            f"{texture_status}",
+            f"{visual_prop_count:,} "
+            "authored visual prop occurrence(s) "
+            f"({len(result.static_instance_objects):,} static, "
+            f"{len(result.collision_instance_objects):,} collision-backed), "
+            f"{result.unique_mesh_count:,} unique leaf "
+            f"mesh(es), {texture_status}",
         )
         return {"FINISHED"}
 
@@ -653,6 +783,7 @@ class KZ_OT_import_model(bpy.types.Operator):
                 raise CoreFormatError(
                     "Scan the configured ISO before importing"
                 )
+            preferences = _addon_preferences(context)
             asset = _selected_model(context)
             library_requests = []
             selected_clip_count = 0
@@ -749,12 +880,12 @@ class KZ_OT_import_model(bpy.types.Operator):
                         result.model.skeleton,
                         library,
                         clips=selected_clips,
-                        writer=context.scene.kz_animation_writer,
+                        writer=preferences.animation_writer,
                         fallback_to_legacy=(
-                            context.scene.kz_animation_fallback_to_legacy
+                            preferences.animation_fallback_to_legacy
                         ),
                         residual_tolerance=(
-                            context.scene.kz_animation_residual_tolerance
+                            preferences.animation_residual_tolerance
                         ),
                     )
                     action_count += len(batch.actions)
@@ -784,7 +915,7 @@ class KZ_OT_import_model(bpy.types.Operator):
             selected_clip_count
         )
         root_collection["killzone_animation_writer"] = (
-            context.scene.kz_animation_writer
+            preferences.animation_writer
         )
         root_collection["killzone_animation_fallback_clip_count"] = (
             fallback_count
@@ -820,45 +951,16 @@ class KZ_OT_import_model(bpy.types.Operator):
                 f"Used the legacy Action writer for {fallback_count} clip(s) "
                 "after an optimized writer failure",
             )
+        placement_note = (
+            ", standalone definition preview (no map placement context)"
+            if asset.kind == "static"
+            else ""
+        )
         self.report(
             {"INFO"},
             f"Imported {asset.display_name}: {part_count} part(s), "
-            f"{triangle_count:,} triangles, {action_count} Action(s)",
-        )
-        return {"FINISHED"}
-
-
-class KZ_OT_import_native_texture(bpy.types.Operator):
-    """Import the selected standalone native Texture as a Blender image"""
-
-    bl_idname = "kz.import_native_texture"
-    bl_label = "Import Texture"
-    bl_options = {"REGISTER", "UNDO"}
-
-    @classmethod
-    def poll(cls, context: bpy.types.Context) -> bool:
-        catalog = _safe_current_catalog(context)
-        return catalog is not None and bool(catalog.textures)
-
-    def execute(self, context: bpy.types.Context) -> set[str]:
-        try:
-            catalog = _current_catalog(context)
-            if catalog is None:
-                raise CoreFormatError(
-                    "Scan the configured ISO before importing"
-                )
-            asset = _selected_texture(context)
-            image = import_native_texture(
-                catalog.source_path,
-                asset.path,
-            )
-        except KZAssetError as exc:
-            self.report({"ERROR"}, str(exc))
-            return {"CANCELLED"}
-        context.scene.kz_last_native_image = image.name
-        self.report(
-            {"INFO"},
-            f"Imported {asset.display_name} as image {image.name}",
+            f"{triangle_count:,} triangles, {action_count} Action(s)"
+            f"{placement_note}",
         )
         return {"FINISHED"}
 
@@ -914,6 +1016,10 @@ class KZ_PT_tools(bpy.types.Panel):
         map_box.label(text="Import Map", icon="WORLD_DATA")
         if catalog.maps:
             map_box.prop(context.scene, "kz_map_asset", text="Map")
+            map_box.label(
+                text="Includes authored static prop placements",
+                icon="INFO",
+            )
             map_box.prop(context.scene, "kz_import_map_textures")
             if context.scene.kz_import_map_textures:
                 map_box.label(
@@ -940,7 +1046,7 @@ class KZ_PT_tools(bpy.types.Panel):
                     text=(
                         "Rigged skinned mesh"
                         if selected_model.kind == "skinned"
-                        else "Static prop"
+                        else "Static definition preview (no map placement)"
                     ),
                     icon=(
                         "ARMATURE_DATA"
@@ -966,10 +1072,31 @@ class KZ_PT_tools(bpy.types.Panel):
                             model_box.label(
                                 text="Model Core has no animation clips"
                             )
-                        model_box.prop(
-                            context.scene,
-                            "kz_additional_animation_bank",
-                            text="Additional Bank",
+                            if _should_suggest_allweapons(selected_model):
+                                hint = model_box.box()
+                                hint.label(
+                                    text="Shared character Actions may be in:",
+                                    icon="INFO",
+                                )
+                                hint.label(
+                                    text="allweapons.default.core"
+                                )
+                        bank_row = model_box.row(align=True)
+                        bank_row.label(text="Additional Bank")
+                        bank_row.operator(
+                            KZ_OT_select_animation_bank.bl_idname,
+                            text=(
+                                f"Search {len(catalog.animation_banks)} "
+                                "Banks..."
+                            ),
+                            icon="VIEWZOOM",
+                        )
+                        model_box.label(
+                            text=_animation_bank_selection_label(
+                                context.scene,
+                                catalog,
+                            ),
+                            icon="ACTION",
                         )
                         clips = context.scene.kz_animation_clips
                         if clips:
@@ -1018,42 +1145,12 @@ class KZ_PT_tools(bpy.types.Panel):
                                 text="No animation clips selected",
                                 icon="INFO",
                             )
-                        model_box.prop(
-                            context.scene,
-                            "kz_animation_writer",
-                            text="Action Writer",
-                        )
-                        if (
-                            context.scene.kz_animation_writer
-                            == ANIMATION_WRITER_BULK
-                        ):
-                            model_box.prop(
-                                context.scene,
-                                "kz_animation_fallback_to_legacy",
-                            )
-                        model_box.prop(
-                            context.scene,
-                            "kz_animation_residual_tolerance",
-                        )
             model_box.operator(
                 KZ_OT_import_model.bl_idname,
                 icon="IMPORT",
             )
         else:
             model_box.label(text="No importable models were cached")
-
-        if catalog.textures:
-            texture_box = layout.box()
-            texture_box.label(text="Import Texture", icon="TEXTURE")
-            texture_box.prop(
-                context.scene,
-                "kz_texture_asset",
-                text="Texture",
-            )
-            texture_box.operator(
-                KZ_OT_import_native_texture.bl_idname,
-                icon="IMPORT",
-            )
 
 
 _CLASSES = (
@@ -1062,10 +1159,10 @@ _CLASSES = (
     KZ_AddonPreferences,
     KZ_OT_scan_assets,
     KZ_OT_open_preferences,
+    KZ_OT_select_animation_bank,
     KZ_OT_set_animation_clip_selection,
     KZ_OT_import_map,
     KZ_OT_import_model,
-    KZ_OT_import_native_texture,
     KZ_PT_tools,
 )
 
@@ -1124,53 +1221,6 @@ def register() -> None:
         options={"HIDDEN"},
         default="",
     )
-    bpy.types.Scene.kz_animation_writer = EnumProperty(
-        name="Animation Writer",
-        description="Blender Action writing strategy",
-        items=(
-            (
-                ANIMATION_WRITER_BULK,
-                "Optimized Bulk FCurves",
-                "Create layered FCurves with vectorized keyframes and "
-                "exact constant-channel reduction",
-            ),
-            (
-                ANIMATION_WRITER_LEGACY,
-                "Legacy Keyframe Insert",
-                "Use the original known-working per-bone keyframe_insert "
-                "writer",
-            ),
-        ),
-        default=ANIMATION_WRITER_BULK,
-    )
-    bpy.types.Scene.kz_animation_fallback_to_legacy = BoolProperty(
-        name="Fallback to Legacy Writer",
-        description=(
-            "Retry a clip with the known-working keyframe_insert writer if "
-            "the optimized Blender Action writer fails"
-        ),
-        default=True,
-    )
-    bpy.types.Scene.kz_animation_residual_tolerance = FloatProperty(
-        name="Animation Tolerance",
-        description=(
-            "Maximum matrix decomposition residual allowed when converting "
-            "native animation to Blender channels"
-        ),
-        default=0.05,
-        min=1.0e-5,
-        soft_max=0.1,
-        precision=5,
-    )
-    bpy.types.Scene.kz_texture_asset = EnumProperty(
-        name="Texture",
-        description="Cached standalone native texture to import",
-        items=_texture_items,
-    )
-    bpy.types.Scene.kz_last_native_image = StringProperty(
-        name="Last Native Image",
-        default="",
-    )
     bpy.types.Scene.kz_last_native_level = StringProperty(
         name="Last Native Map",
         default="",
@@ -1184,11 +1234,6 @@ def register() -> None:
 def unregister() -> None:
     del bpy.types.Scene.kz_last_native_model
     del bpy.types.Scene.kz_last_native_level
-    del bpy.types.Scene.kz_last_native_image
-    del bpy.types.Scene.kz_texture_asset
-    del bpy.types.Scene.kz_animation_residual_tolerance
-    del bpy.types.Scene.kz_animation_fallback_to_legacy
-    del bpy.types.Scene.kz_animation_writer
     del bpy.types.Scene.kz_animation_clip_selection_key
     del bpy.types.Scene.kz_animation_clip_index
     del bpy.types.Scene.kz_animation_clips

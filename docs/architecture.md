@@ -3,7 +3,7 @@
 [Back to the project overview](../README.md)
 
 This document describes the implemented architecture of Killzone Asset Tools
-version 0.13.0.
+version 0.13.1.
 
 Format layouts, corpus measurements, decoding equations, and detailed runtime
 evidence belong in the [technical reference](./technical-reference.md). This
@@ -33,7 +33,7 @@ The project does not currently support:
 
 - writing edited Blender data back into native Killzone resources;
 - rebuilding or repacking `FILES*.DAT`;
-- collision, AI, gameplay, path, effect, sound, or light import;
+- collision geometry, AI, gameplay, path, effect, sound, or light import;
 - full native multi-pass material reconstruction;
 - runtime-generated decals;
 - automatic placement of skinned actors embedded in levels;
@@ -54,7 +54,7 @@ assumptions have been removed:
 | Blender 3.6 LTS was the target | The supported target is Blender 5.2.x; the extension manifest allows versions below 5.3. |
 | Native import and export would be developed together | Native parsing is read-only. Native encoding remains blocked by explicit evidence gates. |
 | Recomp asset overrides and mod packages were part of the add-on architecture | Recomp integration is outside the current product boundary. Runtime evidence may inform parsers without creating an injection pipeline. |
-| Static levels could be reconstructed from `StaticMeshInstance` records alone | The verified graph also has thousands of identity-placed direct roots. Both paths are required. |
+| Static levels could be reconstructed from `StaticMeshInstance` records alone | The verified graph also has collision-backed visual occurrences and hundreds of identity-placed direct roots. All three paths are required. |
 | A decoded texture was equivalent to final game shading | Textures are providers in a larger material and runtime pipeline. Visible Blender shaders are labeled bounded or diagnostic previews. |
 
 Calendar estimates, staffing tables, hypothetical format structures, and
@@ -230,7 +230,7 @@ The cache is serialized as versioned JSON in `AddonPreferences`. It is reused
 across Blender files. Changing the configured source path invalidates the
 active cache until the user rescans.
 
-The validated NTSC-U scan used for version 0.13.0 produces:
+The validated NTSC-U scan used for version 0.13.1 produces:
 
 | Cached category | Count |
 |---|---:|
@@ -328,6 +328,7 @@ A level is not a flat mesh. The render plan contains:
 
 - direct graph roots placed at identity;
 - explicit `StaticMeshInstance` occurrences with source matrices;
+- explicit `CollisionMeshInstance` visual occurrences with source matrices;
 - `SimpleAnimatingSkinnedMeshInstance` metadata;
 - shared resource leaves and wrapper expansion.
 
@@ -335,9 +336,11 @@ The verified 47-level graph has:
 
 - 5,896 static resource roots;
 - 3,158 roots referenced by static instances;
-- 2,738 direct world roots;
-- 2,924 default-LOD direct leaf occurrences;
-- 22,109 default-LOD instance leaf occurrences.
+- 1,985 roots referenced by collision-mesh instances;
+- 753 direct world roots;
+- 813 default-LOD direct leaf occurrences;
+- 22,109 default-LOD static-instance leaf occurrences;
+- 15,928 default-LOD collision-mesh-instance leaf occurrences.
 
 Importing only explicit instances would omit most stored world geometry.
 
@@ -431,11 +434,14 @@ Killzone <map>
 |-- Direct World (identity)
 `-- Props
     |-- Static Instances
+    |-- Collision Mesh Instances
     `-- Animated Skinned Instances (metadata only)
 ```
 
 Repeated occurrences remain distinct Blender objects while sharing exact
-decoded mesh datablocks.
+decoded mesh datablocks. A collision-mesh occurrence uses its reflected
+`General.MeshResource` for visible geometry and retains the companion
+collision-resource identity as metadata; collision geometry is not decoded.
 
 When **Import Map Textures** is disabled, the core skips Texture,
 AnimatedTexture, and Material decoding. Meshes use a diagnostic fallback
@@ -462,6 +468,10 @@ policy as map geometry.
 - selected native Materials and packed images;
 - source and validation metadata.
 
+Static and skinned model adapters use the same host-corrected direct-UV
+routing, bounded material-preview policies, and packed-image path as map
+geometry.
+
 ### 10.4 Animation baking
 
 [`native_animation_io.py`](../io_scene_killzone/native_animation_io.py)
@@ -481,7 +491,9 @@ Actions preserve:
 The sidebar builds a cached multi-select list from the model Core and
 optionally one explicit shared bank. All clips are selected by default for
 backward-compatible behavior, while **All** and **None** controls make bounded
-imports explicit. Libraries with no selected clips are not loaded.
+imports explicit. Libraries with no selected clips are not loaded. The Action
+writer, legacy retry policy, and decomposition tolerance are persistent add-on
+preferences rather than per-scene sidebar controls.
 
 Two Action writers share the same native sampling and decomposition stage:
 
@@ -496,13 +508,16 @@ or decomposition failures are not retried because both writers consume the
 same validated channels. Actions record the writer used, scalar keyframe
 count, FCurve count, and fallback totals.
 
-The visible residual tolerance defaults to `0.05`. Sampled-track motion is the
-default; total-distance root reconstruction is a separate opt-in API policy.
+The preference-level residual tolerance defaults to `0.05`. Sampled-track
+motion is the default; total-distance root reconstruction is a separate
+opt-in API policy.
 
 ### 10.5 Standalone texture import
 
 [`native_texture_io.py`](../io_scene_killzone/native_texture_io.py) creates a
-persistent packed Blender Image with source and decoded hashes.
+persistent packed Blender Image with source and decoded hashes. The dedicated
+sidebar selector is not exposed; map and model imports create their referenced
+images automatically.
 
 ### 10.6 Project-owned bundle adapter
 
@@ -528,14 +543,20 @@ only through named preview policies.
 
 The current policies are:
 
-- `layer0-write`: bounded direct-UV layer-0 `WRITE`;
+- `layer0-write`: bounded direct-UV layer-0 `WRITE`, including proved
+  axis-aligned six-float scale/offset transforms;
 - `single-layer-*-alphaadd-v4-8`: exact admitted indexed `ALPHAADD` with
   Native V4-8 modulation;
+- `two-layer-alphaadd-layerbumpdot3`: bounded direct-UV0/UV1 HQ Grounds
+  composition using layer-1 alpha as a framebuffer multiplier;
+- `two-layer-maskedwrite-alphaadd-cutout`: artist-approximation foliage
+  preview using a byte-quantized strict decoded-alpha cutout while preserving
+  both native passes and their unresolved framebuffer behavior;
 - `diagnostic-color-layerN`: structurally selected decoded provider color;
 - `diagnostic-v4-8-color-layerN`: decoded provider color modulated by
   serialized Native V4-8 outside exact depth/blend admission.
 
-Unsupported multi-layer composition remains disconnected.
+General unsupported multi-layer composition remains disconnected.
 
 ### 11.2 V4-8 modulation
 
@@ -554,13 +575,38 @@ serialized V4-8 is `(37, 36, 32, 128)`. A texture-only diagnostic renders
 white; the V4-8 diagnostic produces the evidenced dark gray-brown tint. Its
 `z_write=1` state remains outside exact `ALPHAADD` admission.
 
-### 11.3 Unresolved material behavior
+### 11.3 Bounded HQ Grounds layer multiplier
+
+HQ Grounds target Materials `0x0054515A` and `0x005450C0` admit a separate
+narrow two-layer policy. The same structural gate also admits `0x005452A4`,
+`0x005453AC`, and `0x0054D4EA`. Layer 0 is indexed `ALPHAADD` on UV0. Layer
+1 is `ALPHA_8` `LAYERBUMPDOT3` on clamped UV1 with TFX policy 3. Their
+packets do carry Native V4-8, with alpha exactly 127. The VU color-stream
+alpha-divide-by-two continuations truncate that lane to fragment alpha 63;
+the no-color-stream fragment `0x62` and its constant alpha 64 do not apply to
+these records. GS HIGHLIGHT and blend policy `0x89` reduce to:
+
+```text
+fragmentAlphaByte = trunc(127 / 2) = 63
+sourceAlphaByte = min(detailAlphaByte + 63, 255)
+previewRGB = layer0RGB * sourceAlphaByte / 128
+```
+
+The detail layer is a scalar mask, not a normal map. The Blender graph keeps
+factors above one so the native brightening range remains visible. It cannot
+reproduce framebuffer content that existed before layer 0, nor exact GS byte
+quantization, final channel saturation, or the complete native lighting term.
+Lighting mode 1 applies the serialized V4-8 RGB modulation to the base
+preview. Materials with a different V4-8 alpha range, different state,
+generated coordinates, optional transforms, or extra layers are not admitted.
+
+### 11.4 Unresolved material behavior
 
 The following remain unresolved or only partially bounded:
 
 - general multi-pass composition;
 - generated coordinate routes;
-- six-float transform convention;
+- rotated or sheared six-float transform convention;
 - dynamic GLOW palette selection;
 - runtime Material mutation;
 - complete PS2 alpha and framebuffer behavior outside captured families;
@@ -573,14 +619,19 @@ Preview metadata must state these limits.
 [`operators.py`](../io_scene_killzone/operators.py) owns registration,
 preferences, dynamic cached selectors, operators, and the **KZ Tools** panel.
 
-The UI has three import sections:
+The UI has two import sections:
 
-- **Import Map**
-- **Import Model**
-- **Import Texture**
+- **Import Map** — full static render graph plus authored prop placements
+- **Import Model** — standalone definition/model preview without map placement
 
-ISO or DAT selection is intentionally located in add-on preferences rather
-than per scene.
+ISO or DAT selection and animation writer settings are intentionally located
+in add-on preferences rather than per scene.
+
+The additional animation-bank selector uses Blender's searchable popup and
+includes each exact `.core` filename in its label. Third-person character
+models with no model-Core clips show a bounded hint to try
+`allweapons.default.core`; vehicle and turret paths are excluded from that
+heuristic.
 
 The scan is manual because it reads and validates hundreds of Core headers and
 selected object directories. Cache schema 2 also records lightweight clip
@@ -651,7 +702,7 @@ The `tests/test_*.py` suite covers:
 - decal policies;
 - cache serialization, map labels, and ordering.
 
-At version 0.13.0 the suite contains 78 passing tests.
+At version 0.13.1 the suite contains 86 passing tests.
 
 ### 15.2 Blender smoke test
 
@@ -660,13 +711,19 @@ behavior, including:
 
 - bundle import/edit/export;
 - native image creation and packing;
+- static and skinned source-V-down to Blender-V-up UV conversion, including
+  authored repeat-tile offsets;
+- axis-aligned six-float UV transforms, mixed-axis wrap, and native alpha-test
+  comparisons;
 - map collection and instance structure;
 - geometry-only map policy;
 - static model import;
 - Armature, weights, and deformation;
 - legacy and optimized Action baking, selected-clip batching, constant-channel
   reduction, automatic fallback, and repeat policy;
-- exact and diagnostic material preview graphs.
+- exact, bounded, and diagnostic material preview graphs, including the
+  HQ Grounds layer multiplier and MASKEDWRITE foliage cutout;
+- add-on-preference animation settings and the shared-bank character hint.
 
 Fixtures are generated procedurally and contain no game data.
 
@@ -725,7 +782,7 @@ docs/
 | Cache discovery in add-on preferences | Scanning is source-wide, while selections are used across Blender files. |
 | Identify objects by directory key plus token | Tokens are not always unique within a Core. |
 | Expand Multi and select LOD child zero | Matches the current bounded default-LOD policy. |
-| Import direct roots and explicit instances | Required by the measured level render graph. |
+| Import direct roots plus static and collision-backed visual instances | Required by the measured level render graph. |
 | Pack decoded images | Blender pixel buffers otherwise may not survive reopening. |
 | Use one rigid weight per skinned target | Matches the verified selector semantics. |
 | Require full Skeleton coverage for automatic batch clips | Avoids silently binding unrelated animation banks. |
@@ -741,14 +798,15 @@ Work is prioritized by evidence gates rather than calendar phases.
 
 ### 18.1 Discovery and workflow
 
-- add search and filtering for large model and animation-bank lists;
+- add search and filtering for large model and animation-clip lists;
 - derive stronger appearance names when serialized naming evidence is found;
 - add scan progress and cache diagnostics without weakening parser strictness.
 
 ### 18.2 Materials
 
 - capture and reproduce additional GS-state families;
-- prove generated-coordinate and optional-transform equations;
+- prove generated-coordinate and rotated/sheared optional-transform
+  equations;
 - determine dynamic GLOW palette sources;
 - separate more exact families from diagnostic color policies;
 - validate material output against bounded runtime captures.
@@ -758,15 +816,15 @@ Work is prioritized by evidence gates rather than calendar phases.
 - connect `SimpleAnimatingSkinnedMeshInstance` records to standalone model and
   animation import;
 - prove proximity-parent transform composition;
-- add read-only collision and gameplay-object inspection only after layouts
-  and semantics are independently bounded;
+- decode collision-resource geometry and add gameplay-object inspection only
+  after their layouts and semantics are independently bounded;
 - preserve higher-LOD data without selecting it by default.
 
 ### 18.4 Skinned models and animations
 
 - connect supported linked-static and blend-shape resources;
 - strengthen inverse-bind/rest-pose evidence;
-- add explicit clip browsing and compatibility explanations;
+- improve per-clip compatibility explanations and shared-bank discovery;
 - expand real-corpus acceptance tests for affine residual policies.
 
 ### 18.5 Native writing
@@ -788,6 +846,8 @@ Until then, native source data remains authoritative and immutable.
 
 - [Project overview](../README.md)
 - [Technical reference](./technical-reference.md)
+- [Map prop instancing research](./map_prop_instancing_research.md)
+- [Material and shader research](./material_shader_research.md)
 - [Blender extension manifest](../io_scene_killzone/blender_manifest.toml)
 - [Pure-Python tests](../tests/)
 - [Companion tools](../tools/)

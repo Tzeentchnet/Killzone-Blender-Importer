@@ -21,6 +21,7 @@ from io_scene_killzone.core.native_animation import (
 from io_scene_killzone.core.native_animation_resource import (
     bind_native_animation,
     discover_native_animation_clips,
+    infer_native_animation_name,
     native_animation_bake_times,
     parse_native_animation_library,
     sample_native_animation_pose,
@@ -972,6 +973,75 @@ class NativePackedAnimationTests(unittest.TestCase):
         self.assertEqual(
             native_animation_bake_times(clip, 2.0),
             (0.0, 0.5, 1.0),
+        )
+
+        semantic_skeleton = replace(
+            skeleton,
+            bones=(
+                replace(skeleton.bones[0], name="Root_joint"),
+                skeleton.bones[1],
+            ),
+        )
+        semantic_bone_map = replace(
+            clip.bone_map,
+            track_names=("Root_joint", "cHiLd"),
+        )
+        semantic_clip = replace(clip, bone_map=semantic_bone_map)
+        semantic_binding = bind_native_animation(
+            semantic_clip,
+            semantic_skeleton,
+        )
+        strings = list(library.header.strings)
+        strings[semantic_skeleton.name_string_index] = replace(
+            strings[semantic_skeleton.name_string_index],
+            raw=b"skelet_Root",
+            utf8="skelet_Root",
+        )
+        semantic_library = replace(
+            library,
+            header=replace(library.header, strings=tuple(strings)),
+            bone_maps=(semantic_bone_map,),
+            clips=(semantic_clip,),
+        )
+        self.assertEqual(
+            infer_native_animation_name(
+                semantic_clip,
+                semantic_skeleton,
+                semantic_binding,
+                semantic_library,
+            ),
+            "Root",
+        )
+        self.assertIsNone(
+            infer_native_animation_name(
+                semantic_clip,
+                semantic_skeleton,
+                semantic_binding,
+                replace(
+                    semantic_library,
+                    clips=(semantic_clip, semantic_clip),
+                ),
+            )
+        )
+        mismatched_strings = list(strings)
+        mismatched_strings[semantic_skeleton.name_string_index] = replace(
+            mismatched_strings[semantic_skeleton.name_string_index],
+            raw=b"skelet_Other",
+            utf8="skelet_Other",
+        )
+        self.assertIsNone(
+            infer_native_animation_name(
+                semantic_clip,
+                semantic_skeleton,
+                semantic_binding,
+                replace(
+                    semantic_library,
+                    header=replace(
+                        semantic_library.header,
+                        strings=tuple(mismatched_strings),
+                    ),
+                ),
+            )
         )
 
         animated_root = replace(

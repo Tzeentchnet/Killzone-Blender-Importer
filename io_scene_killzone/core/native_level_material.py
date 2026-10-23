@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import math
 import struct
-from typing import TYPE_CHECKING, Iterable
+from typing import TYPE_CHECKING, Iterable, Mapping
 
 from .errors import CoreFormatError
 from .native_texture import (
@@ -45,6 +45,12 @@ _PIXEL_FORMATS = {
     22: ("INVALID_PIXELFORMAT", 0, "invalid"),
 }
 _INDEXED_COLOR_FORMATS = {0, 1}
+NATIVE_GS_COLOR_ONE = 128
+NATIVE_LAYERBUMPDOT3_V4_8_ALPHA = 127
+NATIVE_LAYERBUMPDOT3_FRAGMENT_ALPHA = (
+    NATIVE_LAYERBUMPDOT3_V4_8_ALPHA // 2
+)
+NATIVE_MASKEDWRITE_DECODED_ALPHA_CUTOFF = 204
 
 
 @dataclass(frozen=True, slots=True)
@@ -160,6 +166,206 @@ class NativeLevelMaterialPlan:
     instance_material_tokens: tuple[int, ...]
     direct_texture_tokens: tuple[int, ...]
     instance_texture_tokens: tuple[int, ...]
+
+
+def supports_bounded_native_layerbumpdot3_preview(
+    layers: Iterable[NativeMaterialLayer],
+    textures_by_token: Mapping[int, NativeLevelTexture],
+) -> bool:
+    material_layers = tuple(layers)
+    if len(material_layers) != 2:
+        return False
+    base, detail = material_layers
+    if base.lighting_mode not in (0, 1):
+        return False
+
+    def supports_common_state(
+        layer: NativeMaterialLayer,
+        *,
+        index: int,
+        framebuffer_selector: int,
+    ) -> bool:
+        return (
+            layer.index == index
+            and layer.kind == "texture"
+            and layer.resource_token != 0
+            and layer.flags == 0
+            and layer.lighting_mode == base.lighting_mode
+            and layer.z_write == 1
+            and layer.framebuffer_selector == framebuffer_selector
+            and layer.depth_comparison == 3
+            and layer.alpha_test == 7
+            and layer.alpha_reference == 0
+            and layer.filter_policy == 4
+            and layer.texture_enabled == 1
+            and layer.alpha_source_mode == 0
+            and layer.alpha_scalar == 255
+            and layer.fade_mode == 0
+            and layer.fade_values == (0.0, 0.5, 0.5, 1.0)
+            and layer.matrix_4x4 is None
+            and layer.transform_6f is None
+            and not layer.uses_default_transform
+            and layer.directional_vector == (1.0, 0.0, 0.0)
+            and layer.vu_features == (False, False)
+            and layer.palette_policy == "normal"
+            and layer.raw_optional_payload == b""
+        )
+
+    if not (
+        supports_common_state(
+            base,
+            index=0,
+            framebuffer_selector=1,
+        )
+        and base.operation == 5
+        and base.wrap_s == 0
+        and base.wrap_t == 0
+        and base.tfx_policy == 1
+        and base.coordinate_selector == 0
+        and supports_common_state(
+            detail,
+            index=1,
+            framebuffer_selector=0,
+        )
+        and detail.operation == 18
+        and detail.wrap_s == 1
+        and detail.wrap_t == 1
+        and detail.tfx_policy == 3
+        and detail.coordinate_selector == 1
+    ):
+        return False
+
+    base_texture = textures_by_token.get(base.resource_token)
+    detail_texture = textures_by_token.get(detail.resource_token)
+    if base_texture is None or detail_texture is None:
+        return False
+    expected_base_status = {
+        0: "decoded-index4-two-bank",
+        1: "decoded-index8-csm1",
+    }.get(base_texture.pixel_format)
+    return (
+        expected_base_status is not None
+        and base_texture.pixel_format_name in ("INDEX_4", "INDEX_8")
+        and base_texture.decode_status == expected_base_status
+        and base_texture.base_rgba is not None
+        and detail_texture.pixel_format == 3
+        and detail_texture.pixel_format_name == "ALPHA_8"
+        and detail_texture.decode_status == "decoded-alpha8-two-bank"
+        and detail_texture.base_rgba is not None
+    )
+
+
+def supports_diagnostic_native_maskedwrite_alphaadd_preview(
+    layers: Iterable[NativeMaterialLayer],
+    textures_by_token: Mapping[int, NativeLevelTexture],
+) -> bool:
+    material_layers = tuple(layers)
+    if len(material_layers) != 2:
+        return False
+    masked_write, alpha_add = material_layers
+
+    def supports_texture_layer(
+        layer: NativeMaterialLayer,
+        *,
+        index: int,
+    ) -> bool:
+        return (
+            layer.index == index
+            and layer.kind == "texture"
+            and layer.resource_token != 0
+            and layer.texture_enabled == 1
+            and layer.coordinate_selector == 0
+            and layer.matrix_4x4 is None
+            and layer.transform_6f is None
+            and not layer.uses_default_transform
+        )
+
+    if not (
+        supports_texture_layer(masked_write, index=0)
+        and masked_write.operation == 8
+        and masked_write.z_write == 1
+        and masked_write.alpha_test == 4
+        and masked_write.alpha_reference
+        == NATIVE_MASKEDWRITE_DECODED_ALPHA_CUTOFF
+        and supports_texture_layer(alpha_add, index=1)
+        and alpha_add.operation == 5
+        and alpha_add.z_write == 0
+        and alpha_add.resource_token == masked_write.resource_token
+    ):
+        return False
+
+    texture = textures_by_token.get(masked_write.resource_token)
+    return (
+        texture is not None
+        and texture.pixel_format_name
+        in ("INDEX_4", "INDEX_8", "RGBA_8888")
+        and texture.base_rgba is not None
+    )
+
+
+def native_layerbumpdot3_source_alpha_byte(texture_alpha: int) -> int:
+    if type(texture_alpha) is not int or not 0 <= texture_alpha <= 0xFF:
+        raise ValueError("Texture alpha must be a byte")
+    return min(
+        texture_alpha + NATIVE_LAYERBUMPDOT3_FRAGMENT_ALPHA,
+        0xFF,
+    )
+
+
+def native_layerbumpdot3_multiplier(texture_alpha: int) -> float:
+    return (
+        native_layerbumpdot3_source_alpha_byte(texture_alpha)
+        / NATIVE_GS_COLOR_ONE
+    )
+
+
+def native_layerbumpdot3_blend_byte(
+    destination: int,
+    texture_alpha: int,
+) -> int:
+    if type(destination) is not int or not 0 <= destination <= 0xFF:
+        raise ValueError("Destination color must be a byte")
+    source_alpha = native_layerbumpdot3_source_alpha_byte(texture_alpha)
+    return min(
+        (destination * source_alpha) >> 7,
+        0xFF,
+    )
+
+
+def native_alpha_reference_byte(serialized_reference: int) -> int:
+    if (
+        type(serialized_reference) is not int
+        or not 0 <= serialized_reference <= 0xFF
+    ):
+        raise ValueError("Serialized alpha reference must be a byte")
+    return serialized_reference >> 1
+
+
+def native_alpha_test_passes(
+    source_alpha: int,
+    alpha_test: int,
+    serialized_reference: int,
+) -> bool:
+    if type(source_alpha) is not int or not 0 <= source_alpha <= 0xFF:
+        raise ValueError("Source alpha must be a byte")
+    if type(alpha_test) is not int or not 0 <= alpha_test <= 7:
+        raise ValueError("Alpha test must be in the range 0..7")
+    reference = native_alpha_reference_byte(serialized_reference)
+    if alpha_test == 0:
+        return False
+    if alpha_test == 1:
+        return source_alpha < reference
+    if alpha_test == 2:
+        return source_alpha == reference
+    if alpha_test == 3:
+        return source_alpha <= reference
+    if alpha_test == 4:
+        return source_alpha > reference
+    if alpha_test == 5:
+        return source_alpha != reference
+    if alpha_test == 6:
+        return source_alpha >= reference
+    return True
 
 
 def _require_range(data: bytes, offset: int, size: int, label: str) -> None:
@@ -964,10 +1170,16 @@ def parse_selected_materials(
 
             operation = raw_record[0x0C]
             coordinate_selector = raw_record[0x31]
-            if operation > 20 or coordinate_selector > 21:
+            alpha_test = raw_record[0x11]
+            if (
+                operation > 20
+                or coordinate_selector > 21
+                or alpha_test > 7
+            ):
                 raise CoreFormatError(
                     f"Material 0x{token:08X} layer {layer_index} "
-                    "has an out-of-range operation or coordinate selector"
+                    "has an out-of-range operation, coordinate selector, "
+                    "or alpha test"
                 )
             fade_values = struct.unpack_from("<4f", raw_record, 0x1C)
             directional_vector = struct.unpack_from(
@@ -1046,7 +1258,7 @@ def parse_selected_materials(
                     z_write=raw_record[0x0E],
                     framebuffer_selector=raw_record[0x0F],
                     depth_comparison=raw_record[0x10],
-                    alpha_test=raw_record[0x11],
+                    alpha_test=alpha_test,
                     alpha_reference=raw_record[0x12],
                     wrap_s=raw_record[0x13],
                     wrap_t=raw_record[0x14],

@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
+ADDON_VERSION = (0, 13, 1)
+
 bl_info = {
     "name": "Killzone Asset Tools",
     "author": "Killzone Blender contributors",
-    "version": (0, 13, 0),
+    "version": ADDON_VERSION,
     "blender": (5, 2, 0),
     "location": "3D View > Sidebar > KZ Tools",
     "description": "Import Killzone maps, models, textures, and animations",

@@ -8,6 +8,7 @@ import unittest
 from io_scene_killzone.core.core_format import CoreHeader, CoreString
 from io_scene_killzone.core.errors import CoreFormatError
 from io_scene_killzone.core.native_level import (
+    NativeCollisionMeshInstance,
     NativeCoreObject,
     NativeObjectKey,
     NativeSimpleSkinnedInstance,
@@ -15,6 +16,7 @@ from io_scene_killzone.core.native_level import (
     NativeStaticResourceNode,
     build_static_model_render_plan,
     build_static_render_plan,
+    parse_native_collision_mesh_instances,
     parse_native_level_instances,
 )
 from io_scene_killzone.core.native_static_geometry import (
@@ -281,6 +283,47 @@ def _instance(
     )
 
 
+def _collision_instance(
+    key: NativeObjectKey,
+    object_id: int,
+    target: NativeObjectKey,
+) -> NativeCollisionMeshInstance:
+    return NativeCollisionMeshInstance(
+        key=key,
+        object_id=object_id,
+        name=f"collision_instance_{object_id}",
+        name_index=0,
+        name_is_identifier=False,
+        collision_group=0x1C000002,
+        parent_token=0,
+        collision_enabled=True,
+        collision_resource_token=0x9000,
+        collision_resource_key=NativeObjectKey(0x900, 0),
+        collision_resource_type="CollisionResourcePolySoup",
+        resource_token=object_id,
+        resource_key=target,
+        matrix=(
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0,
+            0.0,
+            10.0,
+            20.0,
+            30.0,
+            1.0,
+        ),
+        footer=0x00020001,
+        raw_blob=b"",
+    )
+
+
 def _header(*values: str) -> CoreHeader:
     strings = tuple(
         CoreString(raw=value.encode("utf-8"), utf8=value)
@@ -431,6 +474,28 @@ class NativeStaticGraphTests(unittest.TestCase):
         self.assertEqual(plan.direct_triangle_count, 30)
         self.assertEqual(plan.instance_occurrences, ())
 
+    def test_collision_mesh_reference_is_a_placed_occurrence(self) -> None:
+        resource = _regular(NativeObjectKey(0x100, 0), 1, 10)
+        collision_instance = _collision_instance(
+            NativeObjectKey(0x200, 0),
+            2,
+            resource.key,
+        )
+
+        plan = build_static_render_plan(
+            (resource,),
+            (),
+            (collision_instance,),
+        )
+
+        self.assertEqual(plan.direct_roots, ())
+        self.assertEqual(plan.direct_occurrences, ())
+        self.assertEqual(len(plan.instance_occurrences), 1)
+        occurrence = plan.instance_occurrences[0]
+        self.assertEqual(occurrence.path, "collision-instance")
+        self.assertEqual(occurrence.instance_key, collision_instance.key)
+        self.assertEqual(occurrence.matrix, collision_instance.matrix)
+
     def test_rejects_wrapper_cycles(self) -> None:
         key_a = NativeObjectKey(0x100, 0)
         key_b = NativeObjectKey(0x200, 0)
@@ -562,6 +627,89 @@ class NativeLevelInstanceTests(unittest.TestCase):
         self.assertEqual(animated.matrix, matrix)
         self.assertEqual(animated.footer, 0x00010001)
         self.assertEqual(animated.raw_blob, animated_blob)
+
+    def test_parses_collision_mesh_prop_and_both_references(self) -> None:
+        matrix = (
+            2.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            3.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            4.0,
+            0.0,
+            10.0,
+            20.0,
+            30.0,
+            1.0,
+        )
+        blob = struct.pack(
+            "<4IBB2x16f4I12x",
+            0,
+            0x1C000002,
+            0,
+            0x9000,
+            1,
+            1,
+            *matrix,
+            0x2000,
+            0,
+            0,
+            0x00020001,
+        )
+        static_resource = _regular(
+            NativeObjectKey(0x100, 0),
+            0x2000,
+            1,
+        )
+        collision_resource_key = NativeObjectKey(0x900, 0)
+        instance_key = NativeObjectKey(0x800, 0)
+        objects = (
+            _core_object(
+                instance_key,
+                "CollisionMeshInstance",
+                0x8000,
+                blob,
+            ),
+            _core_object(
+                collision_resource_key,
+                "CollisionResourcePolySoup",
+                0x9000,
+            ),
+        )
+
+        instances = parse_native_collision_mesh_instances(
+            _header("Collision Prop"),
+            objects,
+            (static_resource,),
+        )
+
+        self.assertEqual(len(instances), 1)
+        instance = instances[0]
+        self.assertEqual(instance.key, instance_key)
+        self.assertEqual(instance.name, "Collision Prop")
+        self.assertEqual(instance.name_index, 0)
+        self.assertTrue(instance.name_is_identifier)
+        self.assertEqual(instance.collision_group, 0x1C000002)
+        self.assertTrue(instance.collision_enabled)
+        self.assertEqual(instance.collision_resource_token, 0x9000)
+        self.assertEqual(
+            instance.collision_resource_key,
+            collision_resource_key,
+        )
+        self.assertEqual(
+            instance.collision_resource_type,
+            "CollisionResourcePolySoup",
+        )
+        self.assertEqual(instance.resource_token, 0x2000)
+        self.assertEqual(instance.resource_key, static_resource.key)
+        self.assertEqual(instance.matrix, matrix)
+        self.assertEqual(instance.footer, 0x00020001)
+        self.assertEqual(instance.raw_blob, blob)
 
     def test_rejects_non_null_blend_shape_animation_reference(self) -> None:
         matrix = (

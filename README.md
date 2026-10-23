@@ -15,6 +15,19 @@ known unknowns, see the
 
 ## Highlights
 
+- **UV and texturing improvements** — import static and skinned UVs in
+  Blender's V-up convention, preserve authored repeat-tile offsets and dual
+  UV layers, and apply verified axis-aligned material scale/offset transforms
+  used by texture atlases.
+- **Map prop instancing** — reconstruct direct world geometry plus authored
+  `StaticMeshInstance` and `CollisionMeshInstance` visual occurrences. Every
+  placement becomes a distinct Blender object with its serialized transform,
+  while repeated props safely share immutable mesh datablocks.
+- **Additional texture and material formats** — decode the proven
+  `INDEX_4`, `INDEX_8`, `ALPHA_4`, `ALPHA_8`, `RGBA_8888`, and `RGB_888`
+  texture encodings and build bounded previews for `WRITE`, vertex-modulated
+  `ALPHAADD`, `ALPHAADD + LAYERBUMPDOT3`, and
+  `MASKEDWRITE + ALPHAADD` material families.
 - Cache importable native assets from an authorized ISO or DAT directory.
 - Import naturally ordered maps with optional packed textures.
 - Import standalone static props and skinned models with Skeletons.
@@ -23,8 +36,6 @@ known unknowns, see the
   byte-for-byte.
 - Inspect authorized Killzone disc images and native container catalogs
   without modifying them.
-- Import proven native texture formats and pack decoded images into Blender.
-- Import the experimental default-LOD static render graph from native levels.
 - Import standalone skinned characters with source-order Skeletons, rigid
   vertex assignments, materials, and decoded textures.
 - Decode variant-5 animation banks and bake clips as persistent Blender 5.2
@@ -38,13 +49,12 @@ known unknowns, see the
 
 ### KZ Tools workflow
 
-The sidebar provides cached selectors for maps, static and skinned models, and
-standalone textures.
+The sidebar provides cached selectors for maps and static or skinned models.
 
 <p align="center">
   <img
     src="docs/images/Addon_UI.png"
-    alt="Killzone Asset Tools sidebar with map, model, and texture import controls"
+    alt="Killzone Asset Tools sidebar with map and model import controls"
     width="377"
   >
 </p>
@@ -67,15 +77,16 @@ bounded visible material previews:
 | Area | Status |
 |---|---|
 | Killzone Asset Bundle import/export | Implemented; UI temporarily hidden |
-| Static meshes, normals, UVs, colors, and material slots | Supported |
+| Static meshes, normals, UVs, colors, and material slots | Supported, including dual UVs, repeat offsets, and host-corrected V orientation |
 | ISO/container discovery and catalog reporting | Read-only |
-| Native background and embedded textures | Experimental, read-only |
-| Native static level geometry | Experimental default-LOD import |
+| Native background and embedded textures | Proven indexed, alpha, RGB, and RGBA encodings; read-only |
+| Native static level geometry | Experimental default-LOD graph with direct and instanced occurrences |
 | Native skinned characters and Skeletons | Experimental standalone import |
 | Native animation Actions | Experimental variant-5 import |
-| Native materials | Structural and diagnostic previews |
+| Native materials | Structural assignment plus bounded single- and two-layer previews |
 | Runtime decals | Policies preserved; projected geometry not reconstructed |
-| Collision, gameplay entities, AI, and effects | Not imported |
+| Collision-backed visual props | Authored placements imported with shared mesh data; collision geometry is metadata only |
+| Gameplay entities, AI, and effects | Not imported |
 | Edited native resource export | Not supported |
 
 The project-owned `.kzm` interchange format is not a native Killzone format.
@@ -94,7 +105,7 @@ generated packages, and probe output are excluded by
 
 ## Install in Blender
 
-The current add-on version is **0.13.0**.
+The current add-on version is **0.13.1**.
 
 Build the extension package from the repository root:
 
@@ -129,39 +140,75 @@ Configure native assets once:
 1. Open **Edit > Preferences**, expand **Killzone Asset Tools**, and choose an
    authorized Killzone ISO or a directory containing `FILES.DAT` and
    `FILES01-04.DAT`.
-2. Select **Scan / Rescan Importable Assets**. The resulting map, texture,
-   model, and animation-bank catalog is cached in the add-on preferences and
-   reused across Blender files.
+2. Select **Scan / Rescan Importable Assets**. The resulting map, model, and
+   animation-bank catalog is cached in the add-on preferences and reused
+   across Blender files.
 3. Open **3D View > Sidebar > KZ Tools** to import from the cached selectors.
 
 **Import Map** lists campaign maps by retail chapter and area, followed by
 multiplayer maps, using numeric rather than lexical level ordering. **Import
 Map Textures** is enabled by default; disable it for a geometry-only import
-that skips native texture and material decoding. Enabled imports pack decoded
-images and connect bounded visible material previews; unsupported complex
+that skips native texture and material decoding.
+
+**Map prop instancing.** Map import reconstructs all three verified visual
+paths: direct world roots, ordinary static instances, and collision-backed
+visual instances. It recursively expands Multi resources, selects default
+LOD0, and applies each occurrence's authored matrix. Repeated occurrences are
+separate Blender objects at their intended placements but share decoded mesh
+datablocks. Collision resources remain attached as provenance metadata;
+collision geometry itself is not decoded.
+
+**UV and texture handling.** Enabled texture imports decode and pack native
+images into the Blender file. Direct native UV layers are converted from
+source V-down coordinates to Blender V-up coordinates without discarding
+authored repeat-tile offsets. UV0 and UV1 remain distinct, and bounded
+axis-aligned six-float material transforms apply their serialized scale and
+offset in shader space. This covers verified atlas transforms used by model
+sub-materials; rotated or sheared transforms remain diagnostic rather than
+being guessed.
+
+**Additional material coverage.** Proven native texture decoding now covers
+`INDEX_4`, `INDEX_8`, `ALPHA_4`, `ALPHA_8`, `RGBA_8888`, and `RGB_888`.
+Bounded visible material previews cover direct `WRITE`, serialized Native
+V4-8-modulated `ALPHAADD`, the two-layer
+`ALPHAADD + LAYERBUMPDOT3` family, and the same-texture
+`MASKEDWRITE + ALPHAADD` foliage family. `LAYERBUMPDOT3` is treated as the
+verified scalar/light layer rather than incorrectly connected as a normal
+map. The foliage preview uses a strict decoded-alpha `> 204` cutout and is
+labeled as an artist approximation because the native additive framebuffer
+contribution and low-alpha fringe are not reconstructed. Unsupported complex
 multi-pass shaders remain clearly diagnostic instead of being fabricated.
-Diagnostic `ALPHAADD` previews use serialized Native V4-8 modulation when it
-is present, including materials whose provider texture is intentionally white.
+
 Use Blender's **Material Preview** or **Rendered** viewport shading to see
-those textures; **Solid** shading does not display the shader images.
+imported textures; **Solid** shading does not display shader images.
 
 **Import Model** combines standalone static props and supported skinned model
 roots. Skinned models include their source-order Skeleton and rigid vertex
-assignments. Cached clips from the model Core and one optional shared bank are
-shown as a multi-select checklist. All clips remain selected by default to
-preserve the earlier behavior; use **None** and select only the Actions needed
-for a faster import. Only clips that cover the model's complete Skeleton are
-admitted.
+assignments. Static and skinned model materials use the same bounded decoded
+texture previews and host-corrected direct-UV policy as map meshes. Cached
+clips from the model Core and one optional shared bank are shown as a
+multi-select checklist. All clips remain selected by default to preserve the
+earlier behavior; use **None** and select only the Actions needed for a faster
+import. Use **Search Banks...** to filter the animation-bank catalog by its
+exact `.core` filename or friendly name instead of scrolling the complete
+list. Only clips that cover the model's complete Skeleton are admitted.
+Third-person character models without model-Core clips show a hint to try
+`allweapons.default.core` for shared Actions. A standalone static model is a
+definition preview and has no map placement context; use **Import Map** to
+create every authored prop occurrence at its serialized transform. Map
+occurrences remain distinct Blender objects while safely sharing immutable
+mesh datablocks.
 
-The default **Optimized Bulk FCurves** writer creates Blender 5.2 layered
-Actions with vectorized keyframes and reduces exactly constant channels to one
-key. **Legacy Keyframe Insert** keeps the original known-working writer
-available. Automatic fallback to that legacy writer is enabled by default if
-the optimized Blender-writing stage fails. Native decoding, pose evaluation,
-and decomposition validation are shared by both writers. The visible
-animation decomposition tolerance defaults to `0.05`.
+Animation import settings are in **Edit > Preferences > Add-ons > Killzone
+Asset Tools**. The default **Optimized Bulk FCurves** writer creates Blender
+5.2 layered Actions with vectorized keyframes and reduces exactly constant
+channels to one key. **Legacy Keyframe Insert** keeps the original
+known-working writer available. Automatic fallback to that legacy writer is
+enabled by default if the optimized Blender-writing stage fails. Native
+decoding, pose evaluation, and decomposition validation are shared by both
+writers. The animation decomposition tolerance defaults to `0.05`.
 
-Version 0.13.0 uses asset-cache schema 2 to store lightweight clip identities
+Version 0.13.1 uses asset-cache schema 2 to store lightweight clip identities
 and durations. Run **Scan / Rescan Importable Assets** once after upgrading.
 
 For example, `entity.player.3rd.luger.core` contains 174 compatible clips. On
@@ -170,7 +217,14 @@ the validation machine, importing all of them improved from an estimated
 writer. Selecting one clip creates one Action and avoids parsing or baking the
 other 173 clips.
 
-**Import Texture** retains access to supported standalone native textures.
+When a one-clip Core provides matching serialized Skeleton and root-track
+names, such as `skelet_Collapsing_tank` and `Collapsing_tank_joint`, the Action
+uses the semantic name `Collapsing_tank`. Ambiguous multi-clip banks retain
+their source path, token, and directory-key title. Every Action records its
+requested and final Blender names, naming source, and former coded title in
+the `killzone_action_name_requested`, `killzone_action_name`,
+`killzone_action_name_source`, and `killzone_legacy_action_name` custom
+properties.
 
 Changing the ISO or DAT directory invalidates the active cache until
 **Scan / Rescan Importable Assets** is run again.
@@ -188,7 +242,9 @@ on the Blender Material:
 
 - `killzone_core_local_token`
 - `killzone_preview_mode`
+- `killzone_shader_profile`
 - `killzone_shader_status`
+- `killzone_shader_unimplemented_state_json`
 - `killzone_preview_v4_8_modulation`
 
 The companion tools in [`tools/`](./tools/) also read from an authorized ISO
@@ -216,8 +272,10 @@ documented in the [technical reference](./docs/technical-reference.md).
   final game shading.
 - Generated coordinate routes, some transforms, dynamic palettes, and other
   runtime state remain explicitly unresolved.
-- Static level imports do not include collision, skinned actors, paths, AI,
-  entities, effects, lights, gameplay behavior, or higher-LOD selection.
+- Static level imports place the visual mesh references carried by
+  `CollisionMeshInstance`, but do not decode collision geometry. Skinned
+  actors, paths, AI, entities, effects, lights, gameplay behavior, and
+  higher-LOD selection are not imported.
 - Animation import preserves clip identity, binding diagnostics, timing, and
   decomposition residuals. Blender channel approximations are rejected unless
   the caller explicitly permits a measured tolerance.
@@ -260,6 +318,10 @@ The smoke fixture is generated procedurally and contains no game data.
   evidence, equations, diagnostics, and unresolved boundaries
 - [Architecture](./docs/architecture.md) - implemented module boundaries,
   data flows, decisions, and evidence-gated next steps
+- [Map prop instancing research](./docs/map_prop_instancing_research.md) -
+  occurrence identity, transform handling, mesh sharing, and retail fixtures
+- [Material and shader research](./docs/material_shader_research.md) -
+  texture formats, UV routing, GS state, bounded previews, and open questions
 
 ## License
 

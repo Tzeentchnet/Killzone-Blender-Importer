@@ -18,6 +18,7 @@ from .core.native_animation_resource import (
     NativeAnimationClip,
     NativeAnimationLibrary,
     bind_native_animation,
+    infer_native_animation_name,
     native_animation_bake_times,
     sample_native_animation_pose,
 )
@@ -237,7 +238,7 @@ def _set_linear_interpolation(
                     point.interpolation = "LINEAR"
 
 
-def _action_name(
+def _legacy_action_name(
     clip: NativeAnimationClip,
     library: NativeAnimationLibrary | None,
 ) -> str:
@@ -250,6 +251,35 @@ def _action_name(
         f"{prefix} Animation 0x{clip.object_id:08X} "
         f"[{clip.key.section_offset:06X}:{clip.key.object_index}]"
     )
+
+
+def _resolve_action_name(
+    clip: NativeAnimationClip,
+    skeleton: NativeSkeleton,
+    binding: NativeAnimationBinding,
+    library: NativeAnimationLibrary | None,
+    action_name: str | None,
+) -> tuple[str, str, str]:
+    legacy_name = _legacy_action_name(clip, library)
+    if action_name:
+        return action_name, "explicit-override", legacy_name
+    semantic_name = (
+        infer_native_animation_name(
+            clip,
+            skeleton,
+            binding,
+            library,
+        )
+        if library is not None
+        else None
+    )
+    if semantic_name is not None:
+        return (
+            semantic_name,
+            "serialized-single-clip-skeleton-root",
+            legacy_name,
+        )
+    return legacy_name, "token-directory-fallback", legacy_name
 
 
 def _set_native_action_metadata(
@@ -267,6 +297,9 @@ def _set_native_action_metadata(
     root_policy: str,
     maximum_residual: float,
     writer: str,
+    requested_action_name: str,
+    action_name_source: str,
+    legacy_action_name: str,
     fcurve_count: int | None = None,
     scalar_keyframe_count: int | None = None,
 ) -> None:
@@ -305,6 +338,10 @@ def _set_native_action_metadata(
     )
     action["killzone_decomposition_residual_max"] = maximum_residual
     action["killzone_action_writer"] = writer
+    action["killzone_action_name"] = action.name
+    action["killzone_action_name_requested"] = requested_action_name
+    action["killzone_action_name_source"] = action_name_source
+    action["killzone_legacy_action_name"] = legacy_action_name
     action["killzone_export_supported"] = False
     if fcurve_count is not None:
         action["killzone_fcurve_count"] = fcurve_count
@@ -381,9 +418,18 @@ def bake_native_animation_action(
         else "sampled-tracks-only"
     )
 
-    action = bpy.data.actions.new(
-        action_name or _action_name(clip, library)
+    (
+        resolved_action_name,
+        action_name_source,
+        legacy_action_name,
+    ) = _resolve_action_name(
+        clip,
+        skeleton,
+        resolved_binding,
+        library,
+        action_name,
     )
+    action = bpy.data.actions.new(resolved_action_name)
     animation_data = armature_object.animation_data_create()
     previous_action = animation_data.action
     previous_pose = tuple(
@@ -450,6 +496,9 @@ def bake_native_animation_action(
             root_policy=root_policy,
             maximum_residual=maximum_residual,
             writer="legacy-keyframe-insert",
+            requested_action_name=resolved_action_name,
+            action_name_source=action_name_source,
+            legacy_action_name=legacy_action_name,
         )
     except Exception:
         animation_data.action = previous_action
@@ -537,9 +586,18 @@ def bake_native_animation_action_bulk(
         else "sampled-tracks-only"
     )
 
-    action = bpy.data.actions.new(
-        action_name or _action_name(clip, library)
+    (
+        resolved_action_name,
+        action_name_source,
+        legacy_action_name,
+    ) = _resolve_action_name(
+        clip,
+        skeleton,
+        resolved_binding,
+        library,
+        action_name,
     )
+    action = bpy.data.actions.new(resolved_action_name)
     animation_data = armature_object.animation_data_create()
     previous_action = animation_data.action
     previous_slot = animation_data.action_slot
@@ -628,6 +686,9 @@ def bake_native_animation_action_bulk(
             root_policy=root_policy,
             maximum_residual=maximum_residual,
             writer="bulk-fcurve-foreach-set",
+            requested_action_name=resolved_action_name,
+            action_name_source=action_name_source,
+            legacy_action_name=legacy_action_name,
             fcurve_count=fcurve_count,
             scalar_keyframe_count=scalar_keyframe_count,
         )

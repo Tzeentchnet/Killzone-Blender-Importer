@@ -18,6 +18,8 @@ from .core.native_skinned_model import (
 from .native_level_io import (
     create_native_materials,
     enable_bounded_native_material_previews,
+    native_uv_to_blender,
+    set_native_import_provenance,
 )
 
 
@@ -312,7 +314,7 @@ def _build_skinned_mesh(
         for loop in mesh.loops:
             vertex_coordinates = coordinates[loop.vertex_index]
             uv_layer.data[loop.index].uv = (
-                vertex_coordinates[uv_index]
+                native_uv_to_blender(vertex_coordinates[uv_index])
                 if uv_index < len(vertex_coordinates)
                 else (0.0, 0.0)
             )
@@ -390,6 +392,12 @@ def import_native_skinned_model_data(
     mesh_collection = bpy.data.collections.new("Skinned Meshes (LOD0)")
     context.scene.collection.children.link(root_collection)
     root_collection.children.link(mesh_collection)
+    set_native_import_provenance(
+        root_collection,
+        product="standalone-skinned-model",
+        operator="kz.import_model",
+        level_placement_context_loaded=False,
+    )
     root_collection["killzone_source_path"] = model_path
     root_collection["killzone_core_sha256"] = (
         model.source_core_sha256
