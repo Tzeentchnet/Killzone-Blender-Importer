@@ -20,7 +20,7 @@ from .core.bundle import (
     make_manifest,
     write_manifest,
 )
-from .core.errors import BundleValidationError, ExportValidationError
+from .core.errors import ExportValidationError
 from .core.mesh_format import (
     MeshData,
     Triangle,

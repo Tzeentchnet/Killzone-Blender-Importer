@@ -14,6 +14,7 @@ from .native_texture import (
     decode_csm1_rgba,
     unswizzle_psmt4,
     unswizzle_psmt8,
+    validate_swizzled_plane_shape,
 )
 
 if TYPE_CHECKING:
@@ -51,6 +52,7 @@ NATIVE_LAYERBUMPDOT3_FRAGMENT_ALPHA = (
     NATIVE_LAYERBUMPDOT3_V4_8_ALPHA // 2
 )
 NATIVE_MASKEDWRITE_DECODED_ALPHA_CUTOFF = 204
+NATIVE_TEXTURE_PIXELS_DEFERRED = "pixels-deferred-until-selected"
 
 
 @dataclass(frozen=True, slots=True)
@@ -473,6 +475,8 @@ def _decode_base_rgba(
     height: int,
     base_plane: bytes,
     palette_payload: bytes,
+    decode_pixels: bool = True,
+    include_complement: bool = True,
 ) -> tuple[
     str,
     bytes | None,
@@ -481,6 +485,8 @@ def _decode_base_rgba(
 ]:
     if pixel_format == 1:
         raw_palette = _validate_index8_palette(object_id, palette_payload)
+        if not decode_pixels:
+            return NATIVE_TEXTURE_PIXELS_DEFERRED, None, None, None
         linear_indices = unswizzle_psmt8(base_plane, width, height)
         return (
             "decoded-index8-csm1",
@@ -489,14 +495,18 @@ def _decode_base_rgba(
             None,
         )
     if pixel_format == 5:
+        if not decode_pixels:
+            return NATIVE_TEXTURE_PIXELS_DEFERRED, None, None, None
         return "decoded-rgba8888", None, base_plane, None
     if pixel_format == 13:
-        rgba = bytearray(width * height * 4)
-        for pixel_index in range(width * height):
-            source = pixel_index * 3
-            target = pixel_index * 4
-            rgba[target : target + 3] = base_plane[source : source + 3]
-            rgba[target + 3] = 255
+        if not decode_pixels:
+            return NATIVE_TEXTURE_PIXELS_DEFERRED, None, None, None
+        pixel_count = width * height
+        rgba = bytearray(pixel_count * 4)
+        rgba[0::4] = base_plane[0::3]
+        rgba[1::4] = base_plane[1::3]
+        rgba[2::4] = base_plane[2::3]
+        rgba[3::4] = b"\xff" * pixel_count
         return (
             "decoded-rgb888-host-alpha",
             None,
@@ -507,30 +517,50 @@ def _decode_base_rgba(
         normal_palette, complement_palette = _validate_index4_palette(
             object_id, palette_payload
         )
+        if not decode_pixels:
+            return NATIVE_TEXTURE_PIXELS_DEFERRED, None, None, None
         linear_indices = unswizzle_psmt4(base_plane, width, height)
         return (
             "decoded-index4-two-bank",
             linear_indices,
             _decode_linear_palette(linear_indices, normal_palette),
-            _decode_linear_palette(linear_indices, complement_palette),
+            (
+                _decode_linear_palette(linear_indices, complement_palette)
+                if include_complement
+                else None
+            ),
         )
     if pixel_format == 2:
+        if not decode_pixels:
+            return NATIVE_TEXTURE_PIXELS_DEFERRED, None, None, None
         linear_indices = unswizzle_psmt4(base_plane, width, height)
         return (
             "decoded-alpha4-two-bank",
             linear_indices,
             _decode_alpha_mask(linear_indices, scale=17, complement=False),
-            _decode_alpha_mask(linear_indices, scale=17, complement=True),
+            (
+                _decode_alpha_mask(linear_indices, scale=17, complement=True)
+                if include_complement
+                else None
+            ),
         )
     if pixel_format == 3:
+        if not decode_pixels:
+            return NATIVE_TEXTURE_PIXELS_DEFERRED, None, None, None
         linear_indices = unswizzle_psmt8(base_plane, width, height)
         return (
             "decoded-alpha8-two-bank",
             linear_indices,
             _decode_alpha_mask(linear_indices, scale=1, complement=False),
-            _decode_alpha_mask(linear_indices, scale=1, complement=True),
+            (
+                _decode_alpha_mask(linear_indices, scale=1, complement=True)
+                if include_complement
+                else None
+            ),
         )
     if pixel_format == 4:
+        if not decode_pixels:
+            return NATIVE_TEXTURE_PIXELS_DEFERRED, None, None, None
         linear_indices = unswizzle_psmt8(base_plane, width, height)
         return (
             "decoded-glow8-indices-dynamic-palette",
@@ -551,14 +581,12 @@ def _decode_linear_palette(
     palette: bytes,
 ) -> bytes:
     entry_count = len(palette) // 4
-    rgba = bytearray(len(linear_indices) * 4)
-    for pixel_index, palette_index in enumerate(linear_indices):
-        if palette_index >= entry_count:
-            raise CoreFormatError("Indexed texture references past its palette")
-        source = palette_index * 4
-        target = pixel_index * 4
-        rgba[target : target + 4] = palette[source : source + 4]
-    return bytes(rgba)
+    if linear_indices and max(linear_indices) >= entry_count:
+        raise CoreFormatError("Indexed texture references past its palette")
+    entries = [
+        palette[index * 4 : index * 4 + 4] for index in range(entry_count)
+    ]
+    return b"".join(map(entries.__getitem__, linear_indices))
 
 
 def _decode_alpha_mask(
@@ -567,27 +595,20 @@ def _decode_alpha_mask(
     scale: int,
     complement: bool,
 ) -> bytes:
-    rgba = bytearray(len(linear_indices) * 4)
-    for pixel_index, value in enumerate(linear_indices):
-        alpha = value * scale
-        if complement:
-            alpha = 255 - alpha
-        target = pixel_index * 4
-        rgba[target : target + 4] = bytes((255, 255, 255, alpha))
+    pixel_count = len(linear_indices)
+    alpha_table = bytes(
+        (
+            (255 - value * scale if complement else value * scale)
+            if value * scale <= 255
+            else 0
+        )
+        for value in range(256)
+    )
+    if pixel_count and max(linear_indices) * scale > 255:
+        raise CoreFormatError("Alpha texture index exceeds the byte range")
+    rgba = bytearray(b"\xff" * (pixel_count * 4))
+    rgba[3::4] = linear_indices.translate(alpha_table)
     return bytes(rgba)
-
-
-def _decode_index_plane(
-    pixel_format: int,
-    plane: bytes,
-    width: int,
-    height: int,
-) -> bytes:
-    if pixel_format in (0, 2):
-        return unswizzle_psmt4(plane, width, height)
-    if pixel_format in (1, 3, 4):
-        return unswizzle_psmt8(plane, width, height)
-    raise CoreFormatError("Direct texture has no indexed plane")
 
 
 def _parse_span_records(
@@ -681,6 +702,8 @@ def _parse_span_records(
 def _parse_texture(
     obj: NativeCoreObject,
     corestream_data: bytes,
+    *,
+    decode_pixels: bool = True,
 ) -> NativeLevelTexture:
     _require_range(
         obj.blob,
@@ -878,22 +901,15 @@ def _parse_texture(
             )
         palette_payload = b""
 
-    for mip in mip_entries:
-        if pixel_format not in (0, 1, 2, 3, 4):
-            continue
-        mip_plane = payload[
-            mip.payload_offset : mip.payload_offset + mip.payload_size
-        ]
-        linear = _decode_index_plane(
-            pixel_format,
-            mip_plane,
-            mip.width,
-            mip.height,
-        )
-        if len(linear) != mip.width * mip.height:
-            raise CoreFormatError(
-                f"Texture 0x{obj.object_id:08X} mip {mip.level} "
-                "mapping is incomplete"
+    if pixel_format in (0, 1, 2, 3, 4):
+        # Every mip plane must have a legal PSMT4/PSMT8 block shape. Checking
+        # the shape is enough; unswizzling unused mips only to discard them
+        # dominated texture parse time.
+        for mip in mip_entries:
+            validate_swizzled_plane_shape(
+                sampling_psm,
+                mip.width,
+                mip.height,
             )
 
     span_records, opaque_footer = _parse_span_records(
@@ -920,6 +936,7 @@ def _parse_texture(
         height=height,
         base_plane=base_plane,
         palette_payload=palette_payload,
+        decode_pixels=decode_pixels,
     )
     return NativeLevelTexture(
         key=obj.key,
@@ -953,15 +970,83 @@ def _parse_texture(
     )
 
 
+def decode_level_texture_pixels(
+    texture: NativeLevelTexture,
+    *,
+    include_complement: bool = True,
+) -> NativeLevelTexture:
+    """Return ``texture`` with its base-mip pixels decoded.
+
+    Parsing can defer the pixel work because a level Core carries far more
+    Texture objects than its selected Materials reference.
+    """
+
+    if texture.pixel_format == 22:
+        return texture
+    if texture.decode_status != NATIVE_TEXTURE_PIXELS_DEFERRED and (
+        texture.base_rgba_complement is not None
+        or not include_complement
+        or texture.pixel_format not in (0, 2, 3)
+    ):
+        return texture
+    (
+        decode_status,
+        base_indices,
+        base_rgba,
+        base_rgba_complement,
+    ) = _decode_base_rgba(
+        object_id=texture.object_id,
+        pixel_format=texture.pixel_format,
+        width=texture.width,
+        height=texture.height,
+        base_plane=texture_base_payload(texture),
+        palette_payload=texture.palette_payload,
+        include_complement=include_complement,
+    )
+    return replace(
+        texture,
+        decode_status=decode_status,
+        base_indices=base_indices,
+        base_rgba=base_rgba,
+        base_rgba_complement=base_rgba_complement,
+    )
+
+
+def decode_selected_level_textures(
+    logical_textures: Iterable[NativeLevelTexture],
+    selected_tokens: Iterable[int],
+    complement_tokens: Iterable[int] = (),
+) -> tuple[NativeLevelTexture, ...]:
+    """Decode only the selected logical textures.
+
+    The complementary-alpha bank is decoded only for ``complement_tokens``;
+    ordinary layers always sample the normal bank.
+    """
+
+    selected = set(selected_tokens)
+    complement = set(complement_tokens)
+    return tuple(
+        decode_level_texture_pixels(
+            texture,
+            include_complement=texture.object_id in complement,
+        )
+        if texture.object_id in selected
+        else texture
+        for texture in logical_textures
+    )
+
+
 def parse_level_textures(
     objects: Iterable[NativeCoreObject],
     corestream_data: bytes,
+    *,
+    decode_pixels: bool = True,
 ) -> tuple[
     tuple[NativeLevelTexture, ...],
     tuple[NativeLevelTexture, ...],
 ]:
     physical = tuple(
-        _parse_texture(obj, corestream_data)
+        _parse_texture(obj, corestream_data, decode_pixels=False)
         for obj in objects
         if obj.type_name == "Texture"
     )
@@ -990,7 +1075,26 @@ def parse_level_textures(
                 ),
             )
         )
-    return physical, tuple(logical)
+    if not decode_pixels:
+        return physical, tuple(logical)
+
+    # Decode each logical texture once and share the pixels with its
+    # byte-equivalent physical duplicates.
+    decoded = tuple(decode_level_texture_pixels(value) for value in logical)
+    decoded_by_token = {value.object_id: value for value in decoded}
+    physical = tuple(
+        replace(
+            texture,
+            decode_status=decoded_by_token[texture.object_id].decode_status,
+            base_indices=decoded_by_token[texture.object_id].base_indices,
+            base_rgba=decoded_by_token[texture.object_id].base_rgba,
+            base_rgba_complement=(
+                decoded_by_token[texture.object_id].base_rgba_complement
+            ),
+        )
+        for texture in physical
+    )
+    return physical, decoded
 
 
 def _unique_by_token(
@@ -1329,6 +1433,36 @@ def _material_texture_tokens(
     return tuple(sorted(texture_tokens))
 
 
+def material_complement_texture_tokens(
+    material_tokens: Iterable[int],
+    materials: tuple[NativeMaterial, ...],
+    animations: tuple[NativeAnimatedTexture, ...],
+) -> tuple[int, ...]:
+    """Texture tokens whose complementary-alpha bank a layer may sample."""
+
+    wanted = set(material_tokens)
+    animations_by_token = {
+        value.object_id: value for value in animations
+    }
+    tokens: set[int] = set()
+    for material in materials:
+        if material.object_id not in wanted:
+            continue
+        for layer in material.layers:
+            if layer.palette_policy == "normal":
+                continue
+            if layer.kind == "texture":
+                tokens.add(layer.resource_token)
+            elif layer.kind == "animated_texture":
+                tokens.update(
+                    frame.texture_token
+                    for frame in animations_by_token[
+                        layer.resource_token
+                    ].frames
+                )
+    return tuple(sorted(tokens))
+
+
 def build_level_material_plan(
     direct_material_tokens: Iterable[int],
     instance_material_tokens: Iterable[int],
@@ -1346,6 +1480,63 @@ def build_level_material_plan(
         instance_texture_tokens=_material_texture_tokens(
             instance, materials, animations
         ),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class NativeSelectedMaterialSet:
+    textures: tuple[NativeLevelTexture, ...]
+    logical_textures: tuple[NativeLevelTexture, ...]
+    animated_textures: tuple[NativeAnimatedTexture, ...]
+    materials: tuple[NativeMaterial, ...]
+    material_plan: NativeLevelMaterialPlan
+
+
+def parse_selected_material_set(
+    objects: Iterable[NativeCoreObject],
+    corestream_data: bytes,
+    direct_material_tokens: Iterable[int],
+    instance_material_tokens: Iterable[int] = (),
+) -> NativeSelectedMaterialSet:
+    """Parse selected Materials and decode only the textures they sample."""
+
+    objects = tuple(objects)
+    direct = tuple(direct_material_tokens)
+    instance = tuple(instance_material_tokens)
+    textures, logical_textures = parse_level_textures(
+        objects,
+        corestream_data,
+        decode_pixels=False,
+    )
+    animated_textures = parse_animated_textures(objects, logical_textures)
+    materials = parse_selected_materials(
+        objects,
+        direct + instance,
+        logical_textures,
+        animated_textures,
+    )
+    material_plan = build_level_material_plan(
+        direct,
+        instance,
+        materials,
+        animated_textures,
+    )
+    logical_textures = decode_selected_level_textures(
+        logical_textures,
+        set(material_plan.direct_texture_tokens)
+        | set(material_plan.instance_texture_tokens),
+        material_complement_texture_tokens(
+            direct + instance,
+            materials,
+            animated_textures,
+        ),
+    )
+    return NativeSelectedMaterialSet(
+        textures=textures,
+        logical_textures=logical_textures,
+        animated_textures=animated_textures,
+        materials=materials,
+        material_plan=material_plan,
     )
 
 

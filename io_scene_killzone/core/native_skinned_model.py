@@ -24,10 +24,7 @@ from .native_level_material import (
     NativeLevelMaterialPlan,
     NativeLevelTexture,
     NativeMaterial,
-    build_level_material_plan,
-    parse_animated_textures,
-    parse_level_textures,
-    parse_selected_materials,
+    parse_selected_material_set,
 )
 from .native_skeleton import NativeSkeleton, parse_native_skeleton
 from .native_skinned_geometry import (
@@ -448,24 +445,16 @@ def parse_native_skinned_model(
             }
         )
     )
-    textures, logical_textures = parse_level_textures(
-        objects, corestream_data
-    )
-    animated_textures = parse_animated_textures(
-        objects, logical_textures
-    )
-    materials = parse_selected_materials(
+    material_set = parse_selected_material_set(
         objects,
+        corestream_data,
         material_tokens,
-        logical_textures,
-        animated_textures,
     )
-    material_plan = build_level_material_plan(
-        material_tokens,
-        (),
-        materials,
-        animated_textures,
-    )
+    textures = material_set.textures
+    logical_textures = material_set.logical_textures
+    animated_textures = material_set.animated_textures
+    materials = material_set.materials
+    material_plan = material_set.material_plan
     shape_counts = Counter(
         packet.tail_opcodes
         for resource in selected_resources

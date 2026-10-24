@@ -105,7 +105,6 @@ def _emission_material(
     strength: float,
 ) -> bpy.types.Material:
     material = bpy.data.materials.new(name)
-    material.use_nodes = True
     nodes = material.node_tree.nodes
     links = material.node_tree.links
     nodes.clear()
@@ -152,7 +151,6 @@ def _configure_scene(level_name: str) -> bpy.types.Object:
 
     world = bpy.data.worlds.new("Killzone Diagnostic World")
     scene.world = world
-    world.use_nodes = True
     background = world.node_tree.nodes.get("Background")
     background.inputs["Color"].default_value = (0.012, 0.018, 0.028, 1.0)
     background.inputs["Strength"].default_value = 0.22
@@ -585,8 +583,7 @@ def _texture_investigation(
                         (
                             "framebuffer-history-before-layer0-"
                             "not-representable",
-                            "gs-byte-quantization-and-final-clamp-"
-                            "host-approximated",
+                            "gs-byte-quantization-host-approximated",
                         )
                     )
                     if layer.lighting_mode == 1:

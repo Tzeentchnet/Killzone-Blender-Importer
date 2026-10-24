@@ -3,7 +3,7 @@
 [Back to the project overview](../README.md)
 
 This document describes the implemented architecture of Killzone Asset Tools
-version 0.13.1.
+version 0.14.0.
 
 Format layouts, corpus measurements, decoding equations, and detailed runtime
 evidence belong in the [technical reference](./technical-reference.md). This
@@ -110,6 +110,7 @@ Blender-facing adapters live at the package root:
 - `native_skinned_io.py`
 - `native_animation_io.py`
 - `native_texture_io.py`
+- `native_blender_data.py` (shared bulk mesh and packed-image builders)
 - `scene_io.py`
 
 This separation keeps format tests runnable under ordinary Python.
@@ -702,7 +703,7 @@ The `tests/test_*.py` suite covers:
 - decal policies;
 - cache serialization, map labels, and ordering.
 
-At version 0.13.1 the suite contains 86 passing tests.
+At version 0.14.0 the suite contains 88 passing tests.
 
 ### 15.2 Blender smoke test
 
@@ -747,6 +748,7 @@ io_scene_killzone/
 |-- native_skinned_io.py
 |-- native_animation_io.py
 |-- native_texture_io.py
+|-- native_blender_data.py
 |-- scene_io.py
 `-- core/
     |-- archive_source.py

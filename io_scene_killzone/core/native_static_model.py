@@ -27,10 +27,7 @@ from .native_level_material import (
     NativeLevelMaterialPlan,
     NativeLevelTexture,
     NativeMaterial,
-    build_level_material_plan,
-    parse_animated_textures,
-    parse_level_textures,
-    parse_selected_materials,
+    parse_selected_material_set,
 )
 
 
@@ -121,20 +118,16 @@ def parse_native_static_model(
             }
         )
     )
-    textures, logical_textures = parse_level_textures(objects, corestream_data)
-    animated_textures = parse_animated_textures(objects, logical_textures)
-    materials = parse_selected_materials(
+    material_set = parse_selected_material_set(
         objects,
+        corestream_data,
         material_tokens,
-        logical_textures,
-        animated_textures,
     )
-    material_plan = build_level_material_plan(
-        material_tokens,
-        (),
-        materials,
-        animated_textures,
-    )
+    textures = material_set.textures
+    logical_textures = material_set.logical_textures
+    animated_textures = material_set.animated_textures
+    materials = material_set.materials
+    material_plan = material_set.material_plan
     selected_resources = tuple(
         nodes_by_key[key].regular for key in selected_leaf_keys
     )

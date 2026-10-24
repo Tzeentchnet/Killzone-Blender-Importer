@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import struct
+from types import SimpleNamespace
 import unittest
 
 from io_scene_killzone.core.errors import CoreFormatError
@@ -12,7 +13,10 @@ from io_scene_killzone.core.native_level import (
     NativeObjectKey,
 )
 from io_scene_killzone.core.native_level_material import (
+    NATIVE_TEXTURE_PIXELS_DEFERRED,
     build_level_material_plan,
+    decode_level_texture_pixels,
+    material_complement_texture_tokens,
     native_alpha_reference_byte,
     native_alpha_test_passes,
     native_layerbumpdot3_blend_byte,
@@ -20,6 +24,7 @@ from io_scene_killzone.core.native_level_material import (
     native_layerbumpdot3_source_alpha_byte,
     parse_animated_textures,
     parse_level_textures,
+    parse_selected_material_set,
     parse_selected_materials,
     supports_bounded_native_layerbumpdot3_preview,
     supports_diagnostic_native_maskedwrite_alphaadd_preview,
@@ -284,6 +289,113 @@ class NativeLevelMaterialTests(unittest.TestCase):
         self.assertEqual(
             len(logical[0].base_rgba or b""),
             logical[0].width * logical[0].height * 4,
+        )
+
+    def test_deferred_parse_decodes_only_selected_textures(self) -> None:
+        selected_object, selected_payload = _index8_texture(
+            key_index=0,
+            object_id=0x1000,
+            stream_offset=0,
+        )
+        unused_object, unused_payload = _index8_texture(
+            key_index=1,
+            object_id=0x1100,
+            stream_offset=len(selected_payload),
+        )
+        material_object = _object(
+            key_index=2,
+            type_name="Material",
+            object_id=0x3000,
+            blob=(
+                struct.pack("<I", 1)
+                + bytes(0x14)
+                + _layer(0x1000)
+                + struct.pack("<2I", 0x12345678, 0)
+            ),
+        )
+
+        material_set = parse_selected_material_set(
+            (selected_object, unused_object, material_object),
+            selected_payload + unused_payload,
+            (0x3000,),
+        )
+
+        by_token = {
+            texture.object_id: texture
+            for texture in material_set.logical_textures
+        }
+        self.assertEqual(
+            by_token[0x1000].decode_status,
+            "decoded-index8-csm1",
+        )
+        self.assertEqual(
+            len(by_token[0x1000].base_rgba or b""),
+            16 * 8 * 4,
+        )
+        self.assertEqual(
+            by_token[0x1100].decode_status,
+            NATIVE_TEXTURE_PIXELS_DEFERRED,
+        )
+        self.assertIsNone(by_token[0x1100].base_rgba)
+        self.assertEqual(
+            material_set.material_plan.direct_texture_tokens,
+            (0x1000,),
+        )
+
+        _, eager = parse_level_textures(
+            (selected_object,),
+            selected_payload,
+        )
+        self.assertEqual(eager[0].base_rgba, by_token[0x1000].base_rgba)
+
+    def test_complement_bank_is_decoded_only_on_request(self) -> None:
+        texture_object, payload = _index8_texture(
+            key_index=0,
+            object_id=0x2000,
+            stream_offset=0,
+        )
+        _, (deferred,) = parse_level_textures(
+            (texture_object,),
+            payload,
+            decode_pixels=False,
+        )
+        alpha8 = replace(
+            deferred,
+            pixel_format=3,
+            pixel_format_name="ALPHA_8",
+        )
+
+        normal_only = decode_level_texture_pixels(
+            alpha8,
+            include_complement=False,
+        )
+        self.assertEqual(normal_only.decode_status, "decoded-alpha8-two-bank")
+        self.assertIsNotNone(normal_only.base_rgba)
+        self.assertIsNone(normal_only.base_rgba_complement)
+
+        both = decode_level_texture_pixels(normal_only)
+        self.assertEqual(both.base_rgba, normal_only.base_rgba)
+        assert both.base_rgba is not None
+        assert both.base_rgba_complement is not None
+        self.assertEqual(
+            bytes(255 - value for value in both.base_rgba[3::4]),
+            both.base_rgba_complement[3::4],
+        )
+
+        layers, _ = _bounded_layerbumpdot3_fixture(0)
+        material = SimpleNamespace(object_id=0x3000, layers=layers)
+        self.assertEqual(
+            material_complement_texture_tokens((0x3000,), (material,), ()),
+            (),
+        )
+        complement_layer = replace(layers[1], palette_policy="complement")
+        material = SimpleNamespace(
+            object_id=0x3000,
+            layers=(layers[0], complement_layer),
+        )
+        self.assertEqual(
+            material_complement_texture_tokens((0x3000,), (material,), ()),
+            (0x2000,),
         )
 
     def test_rejects_non_equivalent_duplicate_texture_tokens(self) -> None:

@@ -8,7 +8,6 @@ import json
 import os
 from pathlib import Path, PurePosixPath
 import re
-import shutil
 import tempfile
 from typing import Any, Mapping, Sequence
 

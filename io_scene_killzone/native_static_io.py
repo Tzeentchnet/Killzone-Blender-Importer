@@ -16,6 +16,7 @@ from .native_level_io import (
     _build_resource_mesh,
     _diagnostic_material,
     _object_matrix,
+    NativeMaterialPreviewOptions,
     create_native_materials,
     enable_bounded_native_material_previews,
     set_native_import_provenance,
@@ -41,6 +42,7 @@ def import_native_static_model_data(
     *,
     model_path: str,
     source_path: str | Path | None = None,
+    material_options: NativeMaterialPreviewOptions | None = None,
 ) -> NativeStaticImportResult:
     display_name = Path(model_path).name.removesuffix(".core")
     root_collection = bpy.data.collections.new(f"Killzone {display_name}")
@@ -117,11 +119,14 @@ def import_native_static_model_data(
         mesh_collection.objects.link(obj)
         mesh_objects.append(obj)
 
+    options = material_options or NativeMaterialPreviewOptions()
     preview_counts = enable_bounded_native_material_previews(
         materials_by_token.values(),
         mesh_objects,
         include_write=True,
         include_color_diagnostics=True,
+        artist_lightmap_layers=options.artist_lightmap_layers,
+        artist_fallback=options.artist_fallback,
     )
     root_collection["killzone_native_material_count"] = len(
         materials_by_token
@@ -151,6 +156,7 @@ def import_native_static_model(
     model_path: str,
     *,
     root_token: int | None = None,
+    material_options: NativeMaterialPreviewOptions | None = None,
 ) -> NativeStaticImportResult:
     model = load_native_static_model(
         source_path,
@@ -162,4 +168,5 @@ def import_native_static_model(
         model,
         model_path=model_path,
         source_path=source_path,
+        material_options=material_options,
     )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import hashlib
 from pathlib import Path
 import struct
@@ -76,74 +77,96 @@ def _psmt8_offset(x: int, y: int, width: int) -> int:
     return block_location + column_location + byte_number
 
 
-def unswizzle_psmt8(data: bytes, width: int, height: int) -> bytes:
-    expected_size = width * height
+def _psmt4_nibble_index(x: int, y: int, width: int) -> int:
+    block = (y & ~0x0F) * width + (x & ~0x1F) * 2
+    swap = (((y + 2) >> 2) & 1) * 4
+    py = (((y & ~3) >> 1) + (y & 1)) & 7
+    u = ((x + swap) & 7) + ((x >> 1) & 8)
+    k = ((y >> 1) & 1) + ((x >> 2) & 2)
+    return block + py * (2 * width) + 4 * u + k
+
+
+@lru_cache(maxsize=64)
+def _psmt8_table(width: int, height: int) -> tuple[tuple[int, ...], int]:
+    table = tuple(
+        _psmt8_offset(x, y, width)
+        for y in range(height)
+        for x in range(width)
+    )
+    return table, max(table)
+
+
+@lru_cache(maxsize=64)
+def _psmt4_table(width: int, height: int) -> tuple[tuple[int, ...], int]:
+    table = tuple(
+        _psmt4_nibble_index(x, y, width)
+        for y in range(height)
+        for x in range(width)
+    )
+    return table, max(table)
+
+
+_LOW_NIBBLE = bytes(value & 0x0F for value in range(256))
+_HIGH_NIBBLE = bytes(value >> 4 for value in range(256))
+
+
+def _expand_nibbles(data: bytes) -> bytes:
+    expanded = bytearray(len(data) * 2)
+    expanded[0::2] = data.translate(_LOW_NIBBLE)
+    expanded[1::2] = data.translate(_HIGH_NIBBLE)
+    return bytes(expanded)
+
+
+def validate_swizzled_plane_shape(
+    format_name: str,
+    width: int,
+    height: int,
+) -> None:
     if width <= 0 or height <= 0:
-        raise CoreFormatError("PSMT8 dimensions must be positive")
+        raise CoreFormatError(f"{format_name} dimensions must be positive")
     if width >= 16 and (width % 16 or height % 8):
         raise CoreFormatError(
-            "PSMT8 width must be a positive multiple of 16 and height "
-            "a positive multiple of 8"
+            f"{format_name} width must be a positive multiple of 16 and "
+            "height a positive multiple of 8"
         )
+
+
+def unswizzle_psmt8(data: bytes, width: int, height: int) -> bytes:
+    expected_size = width * height
+    validate_swizzled_plane_shape("PSMT8", width, height)
     if len(data) != expected_size:
         raise CoreFormatError(
             f"PSMT8 payload size is {len(data)}, expected {expected_size}"
         )
     if width < 16:
-        return data
+        return bytes(data)
 
-    result = bytearray(expected_size)
-    for y in range(height):
-        row_offset = y * width
-        for x in range(width):
-            source_offset = _psmt8_offset(x, y, width)
-            if source_offset >= len(data):
-                raise CoreFormatError(
-                    f"PSMT8 source offset 0x{source_offset:X} is out of bounds"
-                )
-            result[row_offset + x] = data[source_offset]
-    return bytes(result)
+    table, maximum = _psmt8_table(width, height)
+    if maximum >= len(data):
+        raise CoreFormatError(
+            f"PSMT8 source offset 0x{maximum:X} is out of bounds"
+        )
+    return bytes(map(data.__getitem__, table))
 
 
 def unswizzle_psmt4(data: bytes, width: int, height: int) -> bytes:
     texel_count = width * height
     expected_size = (texel_count + 1) // 2
-    if width <= 0 or height <= 0:
-        raise CoreFormatError("PSMT4 dimensions must be positive")
-    if width >= 16 and (width % 16 or height % 8):
-        raise CoreFormatError(
-            "PSMT4 width must be a positive multiple of 16 and height "
-            "a positive multiple of 8"
-        )
+    validate_swizzled_plane_shape("PSMT4", width, height)
     if len(data) != expected_size:
         raise CoreFormatError(
             f"PSMT4 payload size is {len(data)}, expected {expected_size}"
         )
 
-    result = bytearray(texel_count)
-    for y in range(height):
-        for x in range(width):
-            if width < 16:
-                nibble_index = y * width + x
-            else:
-                block = (y & ~0x0F) * width + (x & ~0x1F) * 2
-                swap = (((y + 2) >> 2) & 1) * 4
-                py = (((y & ~3) >> 1) + (y & 1)) & 7
-                u = ((x + swap) & 7) + ((x >> 1) & 8)
-                k = ((y >> 1) & 1) + ((x >> 2) & 2)
-                nibble_index = block + py * (2 * width) + 4 * u + k
-            byte_offset = nibble_index >> 1
-            if byte_offset >= len(data):
-                raise CoreFormatError(
-                    f"PSMT4 source offset 0x{byte_offset:X} is out of bounds"
-                )
-            value = data[byte_offset]
-            result[y * width + x] = (
-                (value >> 4) & 0x0F
-                if nibble_index & 1
-                else value & 0x0F
-            )
-    return bytes(result)
+    nibbles = _expand_nibbles(data)
+    if width < 16:
+        return nibbles[:texel_count]
+    table, maximum = _psmt4_table(width, height)
+    if maximum >> 1 >= len(data):
+        raise CoreFormatError(
+            f"PSMT4 source offset 0x{maximum >> 1:X} is out of bounds"
+        )
+    return bytes(map(nibbles.__getitem__, table))
 
 
 def _csm1_palette_index(index: int) -> int:
@@ -152,6 +175,9 @@ def _csm1_palette_index(index: int) -> int:
         | ((index & 0x08) << 1)
         | ((index & 0x10) >> 1)
     )
+
+
+_CSM1_ORDER = tuple(_csm1_palette_index(index) for index in range(256))
 
 
 def decode_csm1_rgba(
@@ -164,14 +190,11 @@ def decode_csm1_rgba(
             f"expected {_PALETTE_SIZE}"
         )
 
-    rgba = bytearray(len(linear_indices) * 4)
-    for pixel_offset, index in enumerate(linear_indices):
-        palette_offset = _csm1_palette_index(index) * 4
-        output_offset = pixel_offset * 4
-        rgba[output_offset : output_offset + 4] = raw_palette[
-            palette_offset : palette_offset + 4
-        ]
-    return bytes(rgba)
+    entries = [
+        raw_palette[position * 4 : position * 4 + 4]
+        for position in _CSM1_ORDER
+    ]
+    return b"".join(map(entries.__getitem__, linear_indices))
 
 
 def parse_native_texture(data: bytes) -> NativeTexture:

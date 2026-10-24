@@ -1,0 +1,40 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Blender 5.2's bundled Python and the bpy wheel use 3.13.
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: .github/workflows/tests.yml
+
+      - name: Install headless Blender runtime libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 libgl1 libsm6 libxi6 libxkbcommon0 libxrender1 \
+            libxxf86vm1 libxfixes3
+
+      - name: Install tools
+        run: python -m pip install ruff bpy==5.2.0
+
+      - name: Lint (pyflakes rules)
+        run: ruff check --select F io_scene_killzone tools tests
+
+      - name: Pure-Python format tests
+        run: python -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Blender smoke test (bpy 5.2 module)
+        run: python tests/blender_smoke.py

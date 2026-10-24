@@ -9,18 +9,18 @@ from pathlib import Path
 import bpy
 from mathutils import Matrix, Vector
 
-from .core.native_level import NativeObjectKey
 from .core.native_skinned_model import (
     NativeSkinnedModel,
     NativeSkinnedResourceNode,
     load_native_skinned_model,
 )
 from .native_level_io import (
+    NativeMaterialPreviewOptions,
     create_native_materials,
     enable_bounded_native_material_previews,
-    native_uv_to_blender,
     set_native_import_provenance,
 )
+from .native_blender_data import build_native_mesh, set_attribute_values
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,7 +70,6 @@ def _diagnostic_material() -> bpy.types.Material:
         return material
     material = bpy.data.materials.new(name)
     material.diffuse_color = (0.32, 0.05, 0.05, 1.0)
-    material.use_nodes = True
     principled = next(
         (
             node
@@ -89,27 +88,6 @@ def _diagnostic_material() -> bpy.types.Material:
         principled.inputs["Roughness"].default_value = 0.72
     material["killzone_diagnostic_material"] = True
     return material
-
-
-def _corrected_triangle(
-    triangle: tuple[int, int, int],
-    positions: list[tuple[float, float, float]],
-    normals: list[tuple[float, float, float]],
-) -> tuple[tuple[int, int, int], bool]:
-    first, second, third = triangle
-    a = Vector(positions[first])
-    b = Vector(positions[second])
-    c = Vector(positions[third])
-    cross = (b - a).cross(c - a)
-    average = (
-        Vector(normals[first])
-        + Vector(normals[second])
-        + Vector(normals[third])
-    )
-    if cross.length_squared > 0.0 and average.length_squared > 0.0:
-        if cross.dot(average) < 0.0:
-            return (first, third, second), True
-    return triangle, False
 
 
 def _create_armature(
@@ -251,7 +229,6 @@ def _build_skinned_mesh(
     coordinates: list[tuple[tuple[float, float], ...]] = []
     triangles: list[tuple[int, int, int]] = []
     material_ids: list[int] = []
-    winding_corrections = 0
 
     for packet in resource.packets:
         base = len(positions)
@@ -272,94 +249,35 @@ def _build_skinned_mesh(
         material_id = resource.records[
             packet.mesh_record_index
         ].material_id
-        for packet_triangle in packet.triangles:
-            triangle = tuple(base + index for index in packet_triangle)
-            corrected, changed = _corrected_triangle(
-                triangle,
-                positions,
-                normals,
-            )
-            triangles.append(corrected)
-            material_ids.append(material_id)
-            winding_corrections += int(changed)
+        triangles.extend(
+            (base + first, base + second, base + third)
+            for first, second, third in packet.triangles
+        )
+        material_ids.extend((material_id,) * len(packet.triangles))
 
     if len(triangles) != resource.triangle_count:
         raise ValueError(
             "Blender skinned mesh triangle count disagrees with source"
         )
-    mesh = bpy.data.meshes.new(
+    mesh, winding_corrections, uv_count = build_native_mesh(
         f"Skinned 0x{node.object_id:08X} "
-        f"[{node.key.section_offset:06X}:{node.key.object_index}]"
+        f"[{node.key.section_offset:06X}:{node.key.object_index}]",
+        positions=positions,
+        normals=normals,
+        triangles=triangles,
+        material_ids=material_ids,
+        materials_by_token=materials_by_token,
+        fallback_material=fallback_material,
+        coordinates=coordinates,
+        colors=colors,
     )
-    mesh.from_pydata(positions, (), triangles)
-    mesh.update()
-
-    material_slots: dict[int, int] = {}
-    for material_id in material_ids:
-        if material_id in material_slots:
-            continue
-        material_slots[material_id] = len(mesh.materials)
-        mesh.materials.append(
-            materials_by_token.get(material_id, fallback_material)
-        )
-    for polygon, material_id in zip(mesh.polygons, material_ids):
-        polygon.material_index = material_slots[material_id]
-
-    if hasattr(mesh, "normals_split_custom_set_from_vertices"):
-        mesh.normals_split_custom_set_from_vertices(normals)
-
-    uv_count = max((len(value) for value in coordinates), default=0)
-    for uv_index in range(uv_count):
-        uv_layer = mesh.uv_layers.new(name=f"Native UV{uv_index}")
-        for loop in mesh.loops:
-            vertex_coordinates = coordinates[loop.vertex_index]
-            uv_layer.data[loop.index].uv = (
-                native_uv_to_blender(vertex_coordinates[uv_index])
-                if uv_index < len(vertex_coordinates)
-                else (0.0, 0.0)
-            )
-
-    if any(color is not None for color in colors):
-        color_attribute = mesh.color_attributes.new(
-            name="Native V4-8",
-            type="BYTE_COLOR",
-            domain="POINT",
-        )
-        for index, color in enumerate(colors):
-            value = color if color is not None else (128, 128, 128, 128)
-            color_attribute.data[index].color = tuple(
-                component / 255.0 for component in value
-            )
-
-    bone_attribute = mesh.attributes.new(
-        name="killzone_bone_index",
-        type="INT",
-        domain="POINT",
+    set_attribute_values(
+        mesh, "killzone_bone_index", "INT", "POINT", bone_indices
     )
-    control_attribute = mesh.attributes.new(
-        name="killzone_source_control",
-        type="INT",
-        domain="POINT",
+    set_attribute_values(
+        mesh, "killzone_source_control", "INT", "POINT", controls
     )
-    adc_attribute = mesh.attributes.new(
-        name="killzone_adc",
-        type="BOOLEAN",
-        domain="POINT",
-    )
-    for index, (bone_index, control, adc) in enumerate(
-        zip(bone_indices, controls, adc_values)
-    ):
-        bone_attribute.data[index].value = bone_index
-        control_attribute.data[index].value = control
-        adc_attribute.data[index].value = adc
-
-    material_attribute = mesh.attributes.new(
-        name="killzone_material_id",
-        type="INT",
-        domain="FACE",
-    )
-    for index, material_id in enumerate(material_ids):
-        material_attribute.data[index].value = material_id
+    set_attribute_values(mesh, "killzone_adc", "BOOLEAN", "POINT", adc_values)
 
     mesh["killzone_object_id"] = f"0x{node.object_id:08X}"
     mesh["killzone_section_offset"] = node.key.section_offset
@@ -384,6 +302,7 @@ def import_native_skinned_model_data(
     *,
     model_path: str,
     source_path: str | Path | None = None,
+    material_options: NativeMaterialPreviewOptions | None = None,
 ) -> NativeSkinnedImportResult:
     display_name = Path(model_path).name.removesuffix(".core")
     root_collection = bpy.data.collections.new(
@@ -487,11 +406,14 @@ def import_native_skinned_model_data(
         modifier.use_vertex_groups = True
         mesh_objects.append(obj)
 
+    options = material_options or NativeMaterialPreviewOptions()
     preview_counts = enable_bounded_native_material_previews(
         materials_by_token.values(),
         mesh_objects,
         include_write=True,
         include_color_diagnostics=True,
+        artist_lightmap_layers=options.artist_lightmap_layers,
+        artist_fallback=options.artist_fallback,
     )
     root_collection["killzone_native_material_count"] = len(
         materials_by_token
@@ -521,6 +443,7 @@ def import_native_skinned_model(
     model_path: str,
     *,
     root_token: int | None = None,
+    material_options: NativeMaterialPreviewOptions | None = None,
 ) -> NativeSkinnedImportResult:
     model = load_native_skinned_model(
         source_path,
@@ -532,4 +455,5 @@ def import_native_skinned_model(
         model,
         model_path=model_path,
         source_path=source_path,
+        material_options=material_options,
     )

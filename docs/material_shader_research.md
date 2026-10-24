@@ -12,7 +12,7 @@ native-format fact and do not imply that native material export is safe.
 
 ## Current implementation status
 
-Killzone Asset Tools 0.13.1 now implements the low-risk subset established by
+Killzone Asset Tools 0.14.0 implements the low-risk subset established by
 this research:
 
 - exact decoding of the observed indexed, alpha-only, RGB, and RGBA texture
@@ -24,7 +24,12 @@ this research:
   output, and byte-aware native alpha-test comparisons;
 - bounded `WRITE` and V4-8 `ALPHAADD` previews;
 - the HQ Grounds `ALPHAADD + LAYERBUMPDOT3` scalar/light composition; and
-- the diagnostic `MASKEDWRITE + ALPHAADD` foliage cutout.
+- the diagnostic `MASKEDWRITE + ALPHAADD` foliage cutout;
+- display-gamma evaluation of V4-8 and LAYERBUMPDOT3 products with GS
+  byte-255 saturation (see section 4.5); and
+- two opt-in artist approximations: LAYERBUMPDOT3 scalar layers composed
+  over admitted `WRITE` bases, and a decoded-color fallback for otherwise
+  unresolved Materials (see section 8.3).
 
 Static maps and standalone static/skinned models share these material and UV
 policies. Generated environment/reflection coordinates, rotated or sheared
@@ -344,7 +349,8 @@ Direct GS STQ does not negate V. Decoded row zero is the image top; Blender's
 image and UV conventions require one deliberate source-to-host orientation
 conversion. The current pair is internally consistent:
 
-- `_create_level_image` reverses rows while filling the Blender image;
+- `_create_level_image` packs a top-row-first PNG, which Blender loads with
+  its bottom-row-first pixel origin;
 - `native_uv_to_blender` returns `(u, 1-v)`.
 
 A normalized Blender sampler already addresses texel centers correctly. Do
@@ -365,6 +371,17 @@ The GS performs fixed-point channel arithmetic. Therefore:
 The current importer marks `ALPHA_*` images Non-Color and other decoded
 images sRGB. That is sensible for an art preview but is not a byte-exact GS
 mode.
+
+Because the GS multiplies display-encoded bytes while Blender's sRGB image
+output is linear light, a GS product `tex * f` (for V4-8 `f = vertex/128` or
+LAYERBUMPDOT3 `f = As/128`) is reconstructed as `linear(tex) * f^2.2`, then
+saturated at 1.0 like the GS byte clamp. A pure 2.2 power is exact for a
+power-law display and within a few percent of the piecewise sRGB curve
+outside deep shadows. Materials using this path record
+`killzone_preview_modulation_space = "display-gamma"` and
+`killzone_preview_display_gamma`. The import operator switches the scene to
+the Standard view transform by default so AgX does not tone-map the unlit
+Emission output.
 
 ## 5. UV channels, generated coordinates, and animation
 
@@ -646,9 +663,11 @@ The material fragment emits `FOGCOL`, `ALPHA_1`, `TEX1_1`, `ZBUF_1`,
 It does not write `TEXA` or `MIPTBP2`.
 
 Blender's Image Texture node has one extension mode for both axes. A mixed
-repeat/clamp material therefore needs coordinate preprocessing, for example
-`Fraction(U)` on a repeating axis and `Clamp(V,0,1)` on a clamped axis,
-before the Image Texture. Merely storing the two native values as custom
+repeat/clamp material therefore needs coordinate preprocessing. The importer
+samples with `REPEAT` and clamps only the clamped axis to the outermost texel
+centres, `[0.5/size, 1 - 0.5/size]`. A `Fraction()` on the repeating axis is
+avoided because its discontinuity breaks texture derivatives and draws mip
+seams at every tile edge. Merely storing the two native values as custom
 properties is not a visual implementation. Likewise, collapsing all
 nonzero filter policies to “Linear” loses mip behavior.
 
@@ -810,6 +829,27 @@ normal mapping. Keep these useful Blender approximations separate:
 - **artist lightmap group**: multiply/add a Non-Color UV1 map into Principled
   or Emission;
 - **artist detail group**: optional high-frequency color/normal treatment.
+
+**Implemented artist lightmap option.** When **Artist Lightmap Layers** is
+enabled, an admitted layer-0 `WRITE` preview composes the first later
+`LAYERBUMPDOT3` (operation 18) `ALPHA_4`/`ALPHA_8` layer with a connected
+direct UV route using the HQ Grounds equation
+`min(Cd * min(At + Af, 255) / 128, 255)` in display-gamma space. `Af` is
+`trunc(V4-8 alpha / 2)` when every user mesh carries the color stream and the
+no-color-stream constant 64 otherwise. Materials are labeled
+`artist-approximation` with preview mode `layer0-write-plus-layerbumpdot3`
+until a GS capture of a `WRITE + LAYERBUMPDOT3` draw confirms the fragment
+alpha. `LIGHTMAPINTENSITY*` and `LIGHTMAPCOLOR2X` layers depend on
+destination alpha and are not composed.
+
+**Open alpha-test question.** The generic alpha-test graph compares decoded
+texture alpha with runtime AREF `reference >> 1`, while the `MASKEDWRITE`
+foliage graph compares decoded alpha with the serialized reference. For the
+same `GREATER 204` state these cut at decoded alpha 102 and 204
+respectively. If the no-color-stream route modulates texture alpha by the
+constant fragment alpha 64 (`As = At * 64 >> 7`), the foliage cutoff is the
+consistent one. Resolve this with a GS capture of Mountain Pass Material
+`0x00FB0B4A` before changing either graph.
 
 ### 8.4 Environment and reflection
 

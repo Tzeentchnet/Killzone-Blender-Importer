@@ -121,7 +121,6 @@ def _render_preview(
     scene.render.image_settings.color_mode = "RGBA"
     scene.view_settings.look = "AgX - Medium High Contrast"
     world = bpy.data.worlds.new("Skinned Preview World")
-    world.use_nodes = True
     world.node_tree.nodes["Background"].inputs["Color"].default_value = (
         0.015,
         0.02,

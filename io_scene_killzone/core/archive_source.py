@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import struct
-from typing import BinaryIO
 
 from .errors import CatalogFormatError
 from .iso9660 import Iso9660Image, IsoRecord

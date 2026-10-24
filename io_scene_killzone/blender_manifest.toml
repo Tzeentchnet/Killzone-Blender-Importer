@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "io_scene_killzone"
-version = "0.13.1"
+version = "0.14.0"
 name = "Killzone Asset Tools"
 tagline = "Import maps, models, textures, and animation Actions"
 maintainer = "Killzone Blender contributors"

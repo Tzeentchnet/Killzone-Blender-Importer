@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 
-ADDON_VERSION = (0, 13, 1)
+ADDON_VERSION = (0, 14, 0)
 
 bl_info = {
     "name": "Killzone Asset Tools",

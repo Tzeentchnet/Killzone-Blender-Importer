@@ -7,7 +7,7 @@ import argparse
 from collections import Counter
 import json
 import os
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 import struct
 import sys
 from typing import Any, Mapping, Sequence

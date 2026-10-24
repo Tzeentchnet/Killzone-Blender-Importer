@@ -167,7 +167,7 @@ def _make_skeleton_blob() -> bytes:
     transform_offset = relative
     relative += bone_count * 0x30
     relative = _align(relative, 0x40)
-    bounds_offset = relative
+    # Bone bounds follow the transforms; the fixture leaves them zeroed.
     relative += bone_count * 0x18
     relative = _align(relative, 0x10)
     attachment_offset = relative

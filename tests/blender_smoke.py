@@ -38,6 +38,8 @@ from io_scene_killzone.core.native_level import (
 )
 from io_scene_killzone.core.native_level_material import (
     NativeLevelMaterialPlan,
+    NativeMaterial,
+    parse_selected_material_set,
 )
 from io_scene_killzone.core.native_static_geometry import (
     NativeRegularStaticResource,
@@ -57,6 +59,7 @@ from io_scene_killzone.core.native_static_model import NativeStaticModel
 from io_scene_killzone.core.native_texture import parse_native_texture
 from io_scene_killzone.native_level_io import (
     _configure_texture_node,
+    create_native_materials,
     _connect_layer_coordinates,
     enable_bounded_native_material_previews,
     import_native_level_data,
@@ -88,6 +91,12 @@ from tests.test_native_skinned import (
     _make_skeleton_blob,
 )
 from tests.test_native_animation import _animation_library_fixture
+from tests.test_native_level_material import (
+    _bounded_layerbumpdot3_fixture,
+    _index8_texture,
+    _layer,
+    _object as _core_object,
+)
 
 
 _IDENTITY_MATRIX = (
@@ -540,6 +549,257 @@ def _assert_mesh_uvs(
         )
 
 
+def _check_packed_level_images_and_reuse() -> None:
+    texture_object, payload = _index8_texture(
+        key_index=0,
+        object_id=0x00ABC000,
+        stream_offset=0,
+    )
+    material_object = _core_object(
+        key_index=1,
+        type_name="Material",
+        object_id=0x00ABC100,
+        blob=(
+            struct.pack("<I", 1)
+            + bytes(0x14)
+            + _layer(0x00ABC000)
+            + struct.pack("<2I", 0x12345678, 0)
+        ),
+    )
+    material_set = parse_selected_material_set(
+        (texture_object, material_object),
+        payload,
+        (0x00ABC100,),
+    )
+    texture = material_set.logical_textures[0]
+    width, height = texture.width, texture.height
+    # Distinct source top-left texel to pin the host row flip.
+    rgba = bytearray(texture.base_rgba or b"")
+    rgba[0:4] = bytes((255, 0, 0, 255))
+    logical = (replace(texture, base_rgba=bytes(rgba)),)
+
+    def build() -> tuple[bpy.types.Material, bpy.types.Image]:
+        materials, images = create_native_materials(
+            logical,
+            material_set.animated_textures,
+            material_set.materials,
+            selected_texture_tokens=(0x00ABC000,),
+            asset_path="levels/synthetic.reuse.core",
+            source_path=None,
+        )
+        return materials[0x00ABC100], images[(0x00ABC000, "normal")]
+
+    first_material, first_image = build()
+    assert first_image.packed_file is not None
+    assert first_image.source == "FILE"
+    assert first_image["killzone_packed_encoding"] == "lossless-png-rgba8"
+    assert tuple(first_image.size) == (width, height)
+    assert first_image.colorspace_settings.name == "sRGB"
+    assert first_image.use_fake_user is False
+    assert first_image.users >= 1
+    pixels = [0.0] * (width * height * 4)
+    first_image.pixels.foreach_get(pixels)
+    top_left = ((height - 1) * width) * 4
+    assert pixels[top_left : top_left + 4] == [1.0, 0.0, 0.0, 1.0]
+    assert pixels[0:4] == [0.0, 0.0, 0.0, 1.0]
+
+    second_material, second_image = build()
+    assert second_material != first_material
+    assert second_image == first_image
+    assert second_image["killzone_reused_by_reimport"] is True
+    image_count = sum(
+        image.get("killzone_core_local_token") == "0x00ABC000"
+        for image in bpy.data.images
+    )
+    assert image_count == 1
+
+
+def _check_artist_material_modes() -> None:
+    layers, textures = _bounded_layerbumpdot3_fixture(0)
+    base_layer, detail_layer = layers
+    write_layer = replace(base_layer, operation=0)
+    material_token = 0x00ABD000
+
+    def build(
+        native_layers: tuple[object, ...],
+        name: str,
+    ) -> tuple[bpy.types.Material, bpy.types.Object]:
+        native = NativeMaterial(
+            key=NativeObjectKey(0x200, 1),
+            object_id=material_token,
+            layers=native_layers,
+            opaque_header=b"",
+            opaque_trailer=b"",
+        )
+        materials, _ = create_native_materials(
+            textures.values(),
+            (),
+            (native,),
+            selected_texture_tokens=tuple(textures),
+            asset_path=f"levels/{name}.core",
+            source_path=None,
+        )
+        material = materials[material_token]
+        mesh = bpy.data.meshes.new(f"{name} Mesh")
+        mesh.from_pydata(
+            ((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+            (),
+            ((0, 1, 2),),
+        )
+        mesh.uv_layers.new(name="Native UV0")
+        mesh.uv_layers.new(name="Native UV1")
+        mesh.materials.append(material)
+        obj = bpy.data.objects.new(f"{name} Object", mesh)
+        bpy.context.scene.collection.objects.link(obj)
+        return material, obj
+
+    material, obj = build((write_layer, detail_layer), "artist_off")
+    counts = enable_bounded_native_material_previews(
+        (material,),
+        (obj,),
+        include_write=True,
+        include_color_diagnostics=True,
+    )
+    assert counts["write"] == 1
+    assert "write_layerbumpdot3" not in counts
+    assert material["killzone_preview_mode"] == "layer0-write"
+
+    material, obj = build((write_layer, detail_layer), "artist_on")
+    counts = enable_bounded_native_material_previews(
+        (material,),
+        (obj,),
+        include_write=True,
+        include_color_diagnostics=True,
+        artist_lightmap_layers=True,
+    )
+    assert counts["write"] == 0
+    assert counts["write_layerbumpdot3"] == 1
+    assert (
+        material["killzone_preview_mode"]
+        == "layer0-write-plus-layerbumpdot3"
+    )
+    assert material["killzone_shader_profile"] == "artist-approximation"
+    assert (
+        material["killzone_preview_fragment_alpha_source"]
+        == "constant-64-unlit-route"
+    )
+    nodes = material.node_tree.nodes
+    assert (
+        nodes["Native Artist Layer 1 Fragment Alpha"]
+        .inputs[1]
+        .default_value
+        == 64.0
+    )
+    assert (
+        nodes["Killzone Preview Emission"]
+        .inputs["Color"]
+        .links[0]
+        .from_node.name
+        == "Native Artist Layer 1 Framebuffer Clamp"
+    )
+    assert (
+        nodes["Native Artist Layer 1 Framebuffer Scale"]
+        .inputs[0]
+        .links[0]
+        .from_node.name
+        == "Native Texture Layer 0"
+    )
+    assert (
+        nodes["Native Artist Layer 1 Alpha Byte"]
+        .inputs[0]
+        .links[0]
+        .from_node.name
+        == "Native Texture Layer 1"
+    )
+
+    unresolved = replace(base_layer, operation=7)
+    material, obj = build((unresolved,), "fallback_off")
+    counts = enable_bounded_native_material_previews(
+        (material,),
+        (obj,),
+        include_write=True,
+        include_color_diagnostics=True,
+    )
+    assert sum(counts.values()) == 0
+    assert material["killzone_shader_profile"] == "unresolved"
+
+    material, obj = build((unresolved,), "fallback_on")
+    counts = enable_bounded_native_material_previews(
+        (material,),
+        (obj,),
+        include_write=True,
+        include_color_diagnostics=True,
+        artist_fallback=True,
+    )
+    assert counts["fallback"] == 1
+    assert material["killzone_shader_profile"] == "artist-fallback"
+    assert material["killzone_preview_mode"] == "artist-fallback-layer0"
+    assert (
+        material.node_tree.nodes["Killzone Preview Emission"]
+        .inputs["Color"]
+        .links[0]
+        .from_node.name
+        == "Native Texture Layer 0"
+    )
+
+
+def _check_failed_import_rollback() -> None:
+    reports: list[tuple[set[str], str]] = []
+    operator = SimpleNamespace(
+        report=lambda kind, message: reports.append((kind, message))
+    )
+    existing_mesh = bpy.data.meshes.new("Rollback Survivor")
+
+    def failing_import(context: bpy.types.Context) -> set[str]:
+        collection = bpy.data.collections.new("Rollback Partial")
+        context.scene.collection.children.link(collection)
+        mesh = bpy.data.meshes.new("Rollback Partial Mesh")
+        collection.objects.link(bpy.data.objects.new("Rollback Obj", mesh))
+        bpy.data.materials.new("Rollback Partial Material")
+        raise KeyError("missing provider")
+
+    print_exc = native_operators.traceback.print_exc
+    native_operators.traceback.print_exc = lambda: None
+    try:
+        status = native_operators._run_import_with_rollback(
+            operator,
+            bpy.context,
+            failing_import,
+        )
+    finally:
+        native_operators.traceback.print_exc = print_exc
+    assert status == {"CANCELLED"}
+    assert "Rollback Partial" not in bpy.data.collections
+    assert "Rollback Partial Mesh" not in bpy.data.meshes
+    assert "Rollback Obj" not in bpy.data.objects
+    assert "Rollback Partial Material" not in bpy.data.materials
+    assert bpy.data.meshes.get("Rollback Survivor") == existing_mesh
+    assert reports and "KeyError" in reports[0][1]
+    assert "4 partial datablock(s) removed" in reports[0][1]
+
+    def cancelled_import(context: bpy.types.Context) -> set[str]:
+        bpy.data.meshes.new("Rollback Cancelled Mesh")
+        return {"CANCELLED"}
+
+    assert native_operators._run_import_with_rollback(
+        operator,
+        bpy.context,
+        cancelled_import,
+    ) == {"CANCELLED"}
+    assert "Rollback Cancelled Mesh" not in bpy.data.meshes
+
+    def finished_import(context: bpy.types.Context) -> set[str]:
+        bpy.data.meshes.new("Rollback Kept Mesh")
+        return {"FINISHED"}
+
+    assert native_operators._run_import_with_rollback(
+        operator,
+        bpy.context,
+        finished_import,
+    ) == {"FINISHED"}
+    assert "Rollback Kept Mesh" in bpy.data.meshes
+
+
 def run() -> None:
     io_scene_killzone.register()
     try:
@@ -717,6 +977,17 @@ def run() -> None:
                 level_result.root_collection["killzone_textures_imported"]
                 is False
             )
+            assert set(
+                json.loads(
+                    level_result.root_collection[
+                        "killzone_import_timings_json"
+                    ]
+                )
+            ) == {
+                "materials_and_images",
+                "meshes_and_objects",
+                "material_previews",
+            }
             assert level_result.material_preview_counts == {
                 "write": 0,
                 "alphaadd": 0,
@@ -1352,7 +1623,6 @@ def run() -> None:
             preview_material = bpy.data.materials.new(
                 "Synthetic INDEX_4 ALPHAADD"
             )
-            preview_material.use_nodes = True
             preview_nodes = preview_material.node_tree.nodes
             preview_links = preview_material.node_tree.links
             preview_nodes.clear()
@@ -1450,18 +1720,40 @@ def run() -> None:
                 principled.inputs["Base Color"]
                 .links[0]
                 .from_node.name
-                == "Native Layer 0 RGB Scale"
+                == "Native Layer 0 RGB Clamp"
             )
             assert (
                 principled.inputs["Alpha"].links[0].from_node.name
                 == "Native Layer 0 Alpha Scale"
             )
             assert abs(
-                preview_nodes["Native Layer 0 RGB Scale"]
+                preview_nodes["Native Layer 0 V4-8 RGB Scale"]
                 .inputs[3]
                 .default_value
                 - 255.0 / 128.0
             ) < 1e-6
+            assert abs(
+                preview_nodes["Native Layer 0 V4-8 Display Gamma"]
+                .inputs["Gamma"]
+                .default_value
+                - 2.2
+            ) < 1e-6
+            assert (
+                preview_nodes["Native Layer 0 RGB Modulate"]
+                .inputs[1]
+                .links[0]
+                .from_node.name
+                == "Native Layer 0 V4-8 Display Gamma"
+            )
+            assert tuple(
+                preview_nodes["Native Layer 0 RGB Clamp"]
+                .inputs[1]
+                .default_value
+            ) == (1.0, 1.0, 1.0)
+            assert (
+                preview_material["killzone_preview_modulation_space"]
+                == "display-gamma"
+            )
             assert not preview_nodes[
                 "Native Layer 0 Alpha Scale"
             ].use_clamp
@@ -1513,7 +1805,6 @@ def run() -> None:
             composition_material = bpy.data.materials.new(
                 "Synthetic ALPHAADD LAYERBUMPDOT3"
             )
-            composition_material.use_nodes = True
             composition_nodes = composition_material.node_tree.nodes
             composition_links = composition_material.node_tree.links
             composition_nodes.clear()
@@ -1621,7 +1912,7 @@ def run() -> None:
             )
             bpy.context.scene.collection.objects.link(composition_object)
 
-            composition_v4_8 = composition_mesh.color_attributes.new(
+            composition_mesh.color_attributes.new(
                 name="Native V4-8",
                 type="BYTE_COLOR",
                 domain="POINT",
@@ -1718,7 +2009,7 @@ def run() -> None:
                 composition_principled.inputs["Base Color"]
                 .links[0]
                 .from_node.name
-                == "Native LayerBumpDot3 Framebuffer Scale"
+                == "Native LayerBumpDot3 Framebuffer Clamp"
             )
             assert (
                 composition_nodes[
@@ -1726,7 +2017,21 @@ def run() -> None:
                 ].inputs[0]
                 .links[0]
                 .from_node.name
-                == "Native Layer 0 RGB Scale"
+                == "Native Layer 0 RGB Clamp"
+            )
+            assert (
+                composition_nodes[
+                    "Native LayerBumpDot3 Framebuffer Scale"
+                ].inputs[3]
+                .links[0]
+                .from_node.name
+                == "Native Layer 1 GS Multiplier Display Gamma"
+            )
+            assert (
+                composition_nodes[
+                    "Native Layer 1 GS Multiplier Display Gamma"
+                ].operation
+                == "POWER"
             )
             assert (
                 composition_material[
@@ -1749,7 +2054,6 @@ def run() -> None:
             masked_material = bpy.data.materials.new(
                 "Synthetic MASKEDWRITE ALPHAADD Foliage"
             )
-            masked_material.use_nodes = True
             masked_nodes = masked_material.node_tree.nodes
             masked_links = masked_material.node_tree.links
             masked_nodes.clear()
@@ -1957,7 +2261,7 @@ def run() -> None:
                 principled.inputs["Base Color"]
                 .links[0]
                 .from_node.name
-                == "Native Layer 0 RGB Scale"
+                == "Native Layer 0 RGB Clamp"
             )
             assert (
                 principled.inputs["Alpha"].links[0].from_node.name
@@ -1966,6 +2270,10 @@ def run() -> None:
             assert (
                 preview_material["killzone_preview_v4_8_modulation"]
                 is True
+            )
+            assert (
+                preview_material["killzone_preview_display_gamma"]
+                == 2.2
             )
             alpha_test_layer = dict(color_layer)
             alpha_test_layer.update(
@@ -1991,6 +2299,7 @@ def run() -> None:
             assert (
                 comparison["killzone_runtime_alpha_reference"] == 102
             )
+            assert preview_material.surface_render_method == "DITHERED"
             assert (
                 preview_material["killzone_shader_profile"]
                 == "artist-approximation"
@@ -2063,7 +2372,6 @@ def run() -> None:
             axis_transform_material = bpy.data.materials.new(
                 "Synthetic Axis UV Transform"
             )
-            axis_transform_material.use_nodes = True
             axis_nodes = axis_transform_material.node_tree.nodes
             axis_links = axis_transform_material.node_tree.links
             axis_nodes.clear()
@@ -2134,7 +2442,6 @@ def run() -> None:
             wrap_material = bpy.data.materials.new(
                 "Synthetic Mixed Wrap"
             )
-            wrap_material.use_nodes = True
             wrap_nodes = wrap_material.node_tree.nodes
             wrap_links = wrap_material.node_tree.links
             wrap_nodes.clear()
@@ -2159,10 +2466,14 @@ def run() -> None:
             assert route_status == (
                 "connected-native-uv0-mixed-axis-wrap"
             )
-            assert wrap_image.extension == "EXTEND"
+            assert wrap_image.extension == "REPEAT"
+            assert "Native Layer 0 X Repeat" not in wrap_nodes
             assert (
-                wrap_nodes["Native Layer 0 X Repeat"].operation
-                == "FRACT"
+                wrap_nodes["Native Layer 0 Wrapped UV"]
+                .inputs["X"]
+                .links[0]
+                .from_node.name
+                == "Native Layer 0 Split UV"
             )
             assert (
                 wrap_nodes["Native Layer 0 Y Clamp Lower"].operation
@@ -2172,6 +2483,63 @@ def run() -> None:
                 wrap_nodes["Native Layer 0 Y Clamp Upper"].operation
                 == "MINIMUM"
             )
+
+            sized_material = bpy.data.materials.new("Synthetic Sized Wrap")
+            sized_nodes = sized_material.node_tree.nodes
+            sized_image_node = sized_nodes.new("ShaderNodeTexImage")
+            sized_image_node.image = bpy.data.images.new(
+                "Synthetic Wrap 64x32",
+                width=64,
+                height=32,
+            )
+            _configure_texture_node(sized_image_node, wrap_layer)
+            _connect_layer_coordinates(
+                nodes=sized_nodes,
+                links=sized_material.node_tree.links,
+                image_node=sized_image_node,
+                layer=wrap_layer,
+                node_y=0.0,
+            )
+            assert (
+                sized_nodes["Native Layer 0 Y Clamp Lower"]
+                .inputs[1]
+                .default_value
+                == 0.5 / 32
+            )
+            assert (
+                abs(
+                    sized_nodes["Native Layer 0 Y Clamp Upper"]
+                    .inputs[1]
+                    .default_value
+                    - (1.0 - 0.5 / 32)
+                )
+                < 1e-7
+            )
+            clamp_layer = SimpleNamespace(**vars(wrap_layer))
+            clamp_layer.wrap_s = 1
+            _configure_texture_node(sized_image_node, clamp_layer)
+            assert sized_image_node.extension == "EXTEND"
+
+        _check_packed_level_images_and_reuse()
+        _check_artist_material_modes()
+        _check_failed_import_rollback()
+
+        scene = bpy.context.scene
+        assert scene.kz_use_standard_view_transform is True
+        assert scene.kz_material_artist_lightmaps is False
+        assert scene.kz_material_artist_fallback is False
+        scene.view_settings.view_transform = "AgX"
+        native_operators._apply_preview_view_transform(scene)
+        assert scene.view_settings.view_transform == "Standard"
+        assert scene.view_settings.look == "None"
+        scene.view_settings.view_transform = "AgX"
+        scene.kz_use_standard_view_transform = False
+        native_operators._apply_preview_view_transform(scene)
+        assert scene.view_settings.view_transform == "AgX"
+        scene.kz_material_artist_lightmaps = True
+        options = native_operators._material_preview_options(scene)
+        assert options.artist_lightmap_layers is True
+        assert options.artist_fallback is False
     finally:
         io_scene_killzone.unregister()
 

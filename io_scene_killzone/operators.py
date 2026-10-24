@@ -6,6 +6,7 @@ import json
 import os
 from collections.abc import Callable
 from pathlib import Path
+import traceback
 
 import bpy
 from bpy.props import (
@@ -34,7 +35,10 @@ from .native_animation_io import (
     NativeAnimationBulkWriteError,
     bake_compatible_native_animation_library,
 )
-from .native_level_io import import_native_level
+from .native_level_io import (
+    NativeMaterialPreviewOptions,
+    import_native_level,
+)
 from .native_skinned_io import import_native_skinned_model
 from .native_static_io import import_native_static_model
 
@@ -706,6 +710,88 @@ class KZ_OT_set_animation_clip_selection(bpy.types.Operator):
         return {"FINISHED"}
 
 
+_ROLLBACK_DATA_COLLECTIONS = (
+    "objects",
+    "meshes",
+    "materials",
+    "images",
+    "collections",
+    "armatures",
+    "actions",
+)
+
+
+class _DatablockSnapshot:
+    """Remember existing datablocks so a failed import can be removed."""
+
+    def __init__(self) -> None:
+        self._before = {
+            name: set(getattr(bpy.data, name))
+            for name in _ROLLBACK_DATA_COLLECTIONS
+        }
+
+    def remove_new(self) -> int:
+        created = [
+            datablock
+            for name in _ROLLBACK_DATA_COLLECTIONS
+            for datablock in getattr(bpy.data, name)
+            if datablock not in self._before[name]
+        ]
+        if created:
+            bpy.data.batch_remove(created)
+        return len(created)
+
+
+def _run_import_with_rollback(
+    operator: bpy.types.Operator,
+    context: bpy.types.Context,
+    run: Callable[[bpy.types.Context], set[str]],
+) -> set[str]:
+    """Run an import; on failure remove everything it had created."""
+
+    snapshot = _DatablockSnapshot()
+    window_manager = context.window_manager
+    window_manager.progress_begin(0.0, 1.0)
+    try:
+        status = run(context)
+    except Exception as exc:
+        traceback.print_exc()
+        removed = snapshot.remove_new()
+        operator.report(
+            {"ERROR"},
+            f"Import failed with {type(exc).__name__}: {exc} "
+            f"({removed} partial datablock(s) removed; see the system "
+            "console for details)",
+        )
+        return {"CANCELLED"}
+    finally:
+        window_manager.progress_end()
+    if "CANCELLED" in status:
+        snapshot.remove_new()
+    return status
+
+
+def _material_preview_options(
+    scene: bpy.types.Scene,
+) -> NativeMaterialPreviewOptions:
+    return NativeMaterialPreviewOptions(
+        artist_lightmap_layers=scene.kz_material_artist_lightmaps,
+        artist_fallback=scene.kz_material_artist_fallback,
+    )
+
+
+def _apply_preview_view_transform(scene: bpy.types.Scene) -> None:
+    """Show unlit native colors without AgX tone mapping."""
+
+    if not scene.kz_use_standard_view_transform:
+        return
+    view_settings = scene.view_settings
+    view_settings.view_transform = "Standard"
+    view_settings.look = "None"
+    view_settings.exposure = 0.0
+    view_settings.gamma = 1.0
+
+
 class KZ_OT_import_map(bpy.types.Operator):
     """Import the selected map's default-LOD static render graph"""
 
@@ -719,6 +805,9 @@ class KZ_OT_import_map(bpy.types.Operator):
         return catalog is not None and bool(catalog.maps)
 
     def execute(self, context: bpy.types.Context) -> set[str]:
+        return _run_import_with_rollback(self, context, self._import)
+
+    def _import(self, context: bpy.types.Context) -> set[str]:
         try:
             catalog = _current_catalog(context)
             if catalog is None:
@@ -731,11 +820,15 @@ class KZ_OT_import_map(bpy.types.Operator):
                 catalog.source_path,
                 asset.path,
                 import_textures=context.scene.kz_import_map_textures,
+                material_options=_material_preview_options(context.scene),
+                progress=context.window_manager.progress_update,
             )
         except (KZAssetError, ValueError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         context.scene.kz_last_native_level = asset.path
+        if context.scene.kz_import_map_textures:
+            _apply_preview_view_transform(context.scene)
         total_triangles = (
             result.level.render_plan.direct_triangle_count
             + result.level.render_plan.instance_triangle_count
@@ -777,6 +870,9 @@ class KZ_OT_import_model(bpy.types.Operator):
         return catalog is not None and bool(catalog.models)
 
     def execute(self, context: bpy.types.Context) -> set[str]:
+        return _run_import_with_rollback(self, context, self._import)
+
+    def _import(self, context: bpy.types.Context) -> set[str]:
         try:
             catalog = _current_catalog(context)
             if catalog is None:
@@ -854,6 +950,9 @@ class KZ_OT_import_model(bpy.types.Operator):
                     catalog.source_path,
                     asset.path,
                     root_token=asset.root_token,
+                    material_options=_material_preview_options(
+                        context.scene
+                    ),
                 )
                 action_count = 0
                 incompatible_count = 0
@@ -868,6 +967,9 @@ class KZ_OT_import_model(bpy.types.Operator):
                     catalog.source_path,
                     asset.path,
                     root_token=asset.root_token,
+                    material_options=_material_preview_options(
+                        context.scene
+                    ),
                 )
                 action_count = 0
                 incompatible_count = 0
@@ -907,6 +1009,7 @@ class KZ_OT_import_model(bpy.types.Operator):
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
 
+        _apply_preview_view_transform(context.scene)
         root_collection["killzone_animation_action_count"] = action_count
         root_collection["killzone_incompatible_animation_clip_count"] = (
             incompatible_count
@@ -1011,6 +1114,20 @@ class KZ_PT_tools(bpy.types.Panel):
             text="Settings",
             icon="PREFERENCES",
         )
+
+        material_box = layout.box()
+        material_box.label(text="Material Preview", icon="MATERIAL")
+        material_box.prop(context.scene, "kz_use_standard_view_transform")
+        material_box.prop(context.scene, "kz_material_artist_lightmaps")
+        material_box.prop(context.scene, "kz_material_artist_fallback")
+        if (
+            context.scene.kz_material_artist_lightmaps
+            or context.scene.kz_material_artist_fallback
+        ):
+            material_box.label(
+                text="Artist modes are approximations, not native output",
+                icon="INFO",
+            )
 
         map_box = layout.box()
         map_box.label(text="Import Map", icon="WORLD_DATA")
@@ -1229,9 +1346,37 @@ def register() -> None:
         name="Last Native Model",
         default="",
     )
+    bpy.types.Scene.kz_use_standard_view_transform = BoolProperty(
+        name="Use Standard View Transform",
+        description=(
+            "Switch the scene to the Standard view transform after import so "
+            "unlit PS2 colors are displayed without AgX tone mapping"
+        ),
+        default=True,
+    )
+    bpy.types.Scene.kz_material_artist_lightmaps = BoolProperty(
+        name="Artist Lightmap Layers",
+        description=(
+            "Compose LAYERBUMPDOT3 scalar layers (usually baked shading on "
+            "UV1) over WRITE base textures. Artist approximation: not yet "
+            "verified against GS output for this family"
+        ),
+        default=False,
+    )
+    bpy.types.Scene.kz_material_artist_fallback = BoolProperty(
+        name="Artist Fallback Textures",
+        description=(
+            "Show the first decoded color layer on materials that have no "
+            "admitted preview instead of the diagnostic object color"
+        ),
+        default=False,
+    )
 
 
 def unregister() -> None:
+    del bpy.types.Scene.kz_material_artist_fallback
+    del bpy.types.Scene.kz_material_artist_lightmaps
+    del bpy.types.Scene.kz_use_standard_view_transform
     del bpy.types.Scene.kz_last_native_model
     del bpy.types.Scene.kz_last_native_level
     del bpy.types.Scene.kz_animation_clip_selection_key
