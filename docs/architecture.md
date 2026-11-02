@@ -3,7 +3,7 @@
 [Back to the project overview](../README.md)
 
 This document describes the implemented architecture of Killzone Asset Tools
-version 0.14.0.
+version 0.15.0.
 
 Format layouts, corpus measurements, decoding equations, and detailed runtime
 evidence belong in the [technical reference](./technical-reference.md). This
@@ -703,7 +703,7 @@ The `tests/test_*.py` suite covers:
 - decal policies;
 - cache serialization, map labels, and ordering.
 
-At version 0.14.0 the suite contains 88 passing tests.
+At version 0.15.0 the suite contains 90 passing tests.
 
 ### 15.2 Blender smoke test
 

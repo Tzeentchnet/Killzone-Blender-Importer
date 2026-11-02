@@ -118,7 +118,7 @@ enabled by default if the optimized Blender-writing stage fails. Native
 decoding, pose evaluation, and decomposition validation are shared by both
 writers. The animation decomposition tolerance defaults to `0.05`.
 
-Version 0.14.0 uses asset-cache schema 2 to store lightweight clip identities
+Version 0.15.0 uses asset-cache schema 2 to store lightweight clip identities
 and durations. Run **Scan / Rescan Importable Assets** once after upgrading.
 
 For example, `entity.player.3rd.luger.core` contains 174 compatible clips. On

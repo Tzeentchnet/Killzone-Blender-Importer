@@ -15,6 +15,14 @@ known unknowns, see the
 
 ## Highlights
 
+- **Asset browser improvements (0.15.0)** — scan progress is visible in
+  Blender, skipped candidates can be inspected, cache lookups avoid repeatedly
+  copying large JSON strings, and the sidebar now has collapsible map, model,
+  texture, and material-preview panels.
+- **Exact native colors and texture import (0.15.0)** — Native V4-8 values use
+  lossless float color attributes, directory scans reuse open container
+  streams, and cached standalone textures can be imported directly as packed
+  Blender images.
 - **Faster imports (0.14.0)** — only textures referenced by the selected
   materials are decoded, once per token; mip validation no longer unswizzles
   discarded mips; the complementary-alpha bank is built only when a layer
@@ -118,7 +126,7 @@ generated packages, and probe output are excluded by
 
 ## Install in Blender
 
-The current add-on version is **0.14.0**.
+The current add-on version is **0.15.0**.
 
 Build the extension package from the repository root:
 

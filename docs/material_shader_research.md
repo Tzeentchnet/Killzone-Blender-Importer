@@ -12,7 +12,7 @@ native-format fact and do not imply that native material export is safe.
 
 ## Current implementation status
 
-Killzone Asset Tools 0.14.0 implements the low-risk subset established by
+Killzone Asset Tools 0.15.0 implements the low-risk subset established by
 this research:
 
 - exact decoding of the observed indexed, alpha-only, RGB, and RGBA texture
