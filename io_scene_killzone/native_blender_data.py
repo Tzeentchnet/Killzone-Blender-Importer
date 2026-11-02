@@ -218,9 +218,12 @@ def build_native_mesh(
             )
 
     if any(color is not None for color in colors):
+        # FLOAT_COLOR keeps every serialized byte exact. BYTE_COLOR stores
+        # sRGB-encoded bytes, so writing linear byte/255 values through it
+        # round-trips with up to one byte of error (128 reads back as 128.24).
         color_attribute = mesh.color_attributes.new(
             name="Native V4-8",
-            type="BYTE_COLOR",
+            type="FLOAT_COLOR",
             domain="POINT",
         )
         color_array = np.asarray(

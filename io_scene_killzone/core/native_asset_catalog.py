@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 import json
 from pathlib import Path, PurePosixPath
@@ -389,7 +390,15 @@ def _animation_bank_display_name(path: str, clip_count: int) -> str:
 
 def scan_native_asset_catalog(
     source_path: str | Path,
+    *,
+    progress: Callable[[float], None] | None = None,
 ) -> NativeAssetCatalog:
+    """Scan an ISO or DAT directory for importable native assets.
+
+    ``progress`` is called with a fraction in ``[0, 1]`` as Core entries are
+    inspected, so a host UI can show that a long scan is still running.
+    """
+
     maps: list[NativeCachedMap] = []
     textures: list[NativeCachedTexture] = []
     models: list[NativeCachedModel] = []
@@ -413,7 +422,12 @@ def scan_native_asset_catalog(
             )
         )
 
-        for entry in core_entries:
+        core_count = len(core_entries)
+        if progress is not None:
+            progress(0.0)
+        for entry_index, entry in enumerate(core_entries):
+            if progress is not None and entry_index % 16 == 0:
+                progress(entry_index / max(1, core_count))
             path = entry.path.as_posix()
             name = entry.path.name.casefold()
             stream_path = entry.path.with_suffix(".corestream").as_posix()
@@ -609,6 +623,8 @@ def scan_native_asset_catalog(
                     )
                 )
 
+        if progress is not None:
+            progress(1.0)
         return NativeAssetCatalog(
             source_path=str(source.source_path),
             source_type=source.source_type,

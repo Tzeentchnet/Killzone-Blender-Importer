@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from collections.abc import Callable
@@ -9,6 +10,7 @@ from pathlib import Path
 import traceback
 
 import bpy
+import numpy as np
 from bpy.props import (
     BoolProperty,
     CollectionProperty,
@@ -25,6 +27,7 @@ from .core.native_asset_catalog import (
     NativeCachedAnimationBank,
     NativeCachedMap,
     NativeCachedModel,
+    NativeCachedTexture,
     scan_native_asset_catalog,
 )
 from .core.native_level import NativeObjectKey
@@ -41,14 +44,27 @@ from .native_level_io import (
 )
 from .native_skinned_io import import_native_skinned_model
 from .native_static_io import import_native_static_model
+from .native_texture_io import import_native_texture
 
 
 _ADDON_ID = __package__
 _NO_ITEMS = "__NONE__"
 _NO_BANK = "NONE"
 _cached_json = ""
+_cached_digest = ""
 _cached_catalog: NativeAssetCatalog | None = None
 _enum_items: dict[str, list[tuple[str, str, str]]] = {}
+# Returned (not cached) while no catalog is usable, so a later valid catalog
+# is never masked by a stale placeholder. Module-level so Blender keeps the
+# enum strings alive.
+_EMPTY_ASSET_ITEMS = [(_NO_ITEMS, "No cached assets", "Scan the ISO first")]
+_NO_BANK_ITEM = (
+    _NO_BANK,
+    "None (model Core only)",
+    "Bake compatible clips stored with the selected model",
+)
+_EMPTY_BANK_ITEMS = [_NO_BANK_ITEM]
+_MAX_LISTED_SCAN_ISSUES = 25
 _ANIMATION_WRITER_ITEMS = (
     (
         ANIMATION_WRITER_BULK,
@@ -84,10 +100,15 @@ _THIRD_PERSON_NON_CHARACTER_TERMS = (
 
 
 def _invalidate_runtime_cache() -> None:
-    global _cached_json, _cached_catalog
+    global _cached_json, _cached_digest, _cached_catalog
     _cached_json = ""
+    _cached_digest = ""
     _cached_catalog = None
     _enum_items.clear()
+
+
+def _catalog_digest(raw: str) -> str:
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _addon_preferences(
@@ -104,13 +125,20 @@ def _addon_preferences(
 def _catalog_from_preferences(
     preferences: KZ_AddonPreferences,
 ) -> NativeAssetCatalog | None:
-    global _cached_json, _cached_catalog
+    global _cached_json, _cached_digest, _cached_catalog
+    # Panels and operator polls call this many times per redraw. Reading the
+    # multi-megabyte cache string copies it out of RNA each time, so compare
+    # the small digest written by the scan operator first.
+    digest = preferences.asset_cache_digest
+    if digest and digest == _cached_digest and _cached_catalog is not None:
+        return _cached_catalog
     raw = preferences.asset_cache_json
     if not raw:
         return None
     if raw != _cached_json:
         _cached_catalog = NativeAssetCatalog.from_json(raw)
         _cached_json = raw
+        _cached_digest = _catalog_digest(raw)
         _enum_items.clear()
     return _cached_catalog
 
@@ -153,16 +181,15 @@ def _cached_items(
     label: Callable[[object], str],
     description: Callable[[object], str],
 ) -> list[tuple[str, str, str]]:
+    if not values:
+        return _EMPTY_ASSET_ITEMS
     cached = _enum_items.get(key)
     if cached is not None:
         return cached
-    if not values:
-        cached = [(_NO_ITEMS, "No cached assets", "Scan the ISO first")]
-    else:
-        cached = [
-            (str(index), label(value), description(value))
-            for index, value in enumerate(values)
-        ]
+    cached = [
+        (str(index), label(value), description(value))
+        for index, value in enumerate(values)
+    ]
     _enum_items[key] = cached
     return cached
 
@@ -198,22 +225,32 @@ def _model_items(
     )
 
 
+def _texture_items(
+    _self: object,
+    context: bpy.types.Context,
+) -> list[tuple[str, str, str]]:
+    catalog = _safe_current_catalog(context)
+    values = () if catalog is None else catalog.textures
+    return _cached_items(
+        "textures",
+        values,
+        lambda value: value.display_name,
+        lambda value: value.path,
+    )
+
+
 def _animation_bank_items(
     _self: object,
     context: bpy.types.Context,
 ) -> list[tuple[str, str, str]]:
     catalog = _safe_current_catalog(context)
-    values = () if catalog is None else catalog.animation_banks
+    if catalog is None or not catalog.animation_banks:
+        return _EMPTY_BANK_ITEMS
+    values = catalog.animation_banks
     key = "animation-banks"
     cached = _enum_items.get(key)
     if cached is None:
-        cached = [
-            (
-                _NO_BANK,
-                "None (model Core only)",
-                "Bake compatible clips stored with the selected model",
-            )
-        ]
+        cached = [_NO_BANK_ITEM]
         cached.extend(
             (
                 f"bank:{index}",
@@ -289,6 +326,20 @@ def _selected_map(
         "map",
     )
     return catalog.maps[index]
+
+
+def _selected_texture(
+    context: bpy.types.Context,
+) -> NativeCachedTexture:
+    catalog = _current_catalog(context)
+    if catalog is None:
+        raise CoreFormatError("Scan the configured ISO before importing")
+    index = _selected_index(
+        context.scene.kz_texture_asset,
+        len(catalog.textures),
+        "texture",
+    )
+    return catalog.textures[index]
 
 
 def _selected_model(
@@ -436,12 +487,19 @@ def _reset_scene_selections(catalog: NativeAssetCatalog) -> None:
     selections = (
         ("kz_map_asset", bool(catalog.maps)),
         ("kz_model_asset", bool(catalog.models)),
+        ("kz_texture_asset", bool(catalog.textures)),
     )
     for scene in bpy.data.scenes:
         for property_name, has_items in selections:
             setattr(scene, property_name, "0" if has_items else _NO_ITEMS)
         scene.kz_additional_animation_bank = _NO_BANK
-        _populate_animation_clips(scene, catalog)
+        try:
+            _populate_animation_clips(scene, catalog)
+        except KZAssetError:
+            # A model whose clip bank was not admitted must not abort the
+            # scan after the new cache has already been stored.
+            scene.kz_animation_clips.clear()
+            scene.kz_animation_clip_selection_key = ""
 
 
 class KZ_PG_animation_clip(bpy.types.PropertyGroup):
@@ -517,6 +575,11 @@ class KZ_AddonPreferences(bpy.types.AddonPreferences):
         options={"HIDDEN"},
         default="",
     )
+    asset_cache_digest: StringProperty(
+        name="Native Asset Cache Digest",
+        options={"HIDDEN"},
+        default="",
+    )
 
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout
@@ -579,6 +642,10 @@ class KZ_AddonPreferences(bpy.types.AddonPreferences):
                 ),
                 icon="ERROR",
             )
+            box.operator(
+                KZ_OT_show_scan_issues.bl_idname,
+                icon="VIEWZOOM",
+            )
 
 
 class KZ_OT_scan_assets(bpy.types.Operator):
@@ -597,23 +664,36 @@ class KZ_OT_scan_assets(bpy.types.Operator):
             )
             return {"CANCELLED"}
         source_path = bpy.path.abspath(preferences.archive_source)
-        context.window_manager.progress_begin(0, 1)
+        window_manager = context.window_manager
+        window_manager.progress_begin(0.0, 1.0)
         try:
-            catalog = scan_native_asset_catalog(source_path)
+            catalog = scan_native_asset_catalog(
+                source_path,
+                progress=window_manager.progress_update,
+            )
         except (KZAssetError, OSError) as exc:
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         finally:
-            context.window_manager.progress_end()
+            window_manager.progress_end()
+        raw = catalog.to_json()
         preferences.archive_source = catalog.source_path
-        preferences.asset_cache_json = catalog.to_json()
+        preferences.asset_cache_json = raw
+        preferences.asset_cache_digest = _catalog_digest(raw)
         _invalidate_runtime_cache()
         _catalog_from_preferences(preferences)
         _reset_scene_selections(catalog)
         if catalog.issues:
             self.report(
                 {"WARNING"},
-                f"Skipped {len(catalog.issues)} unsupported candidate(s)",
+                f"Skipped {len(catalog.issues)} unsupported candidate(s); "
+                "use Show Skipped Candidates in the add-on preferences",
+            )
+        if not context.preferences.use_preferences_save:
+            self.report(
+                {"WARNING"},
+                "Preferences auto-save is off; save preferences to keep "
+                "this scan after restarting Blender",
             )
         self.report(
             {"INFO"},
@@ -631,8 +711,54 @@ class KZ_OT_open_preferences(bpy.types.Operator):
     bl_label = "Open Add-on Preferences"
 
     def execute(self, context: bpy.types.Context) -> set[str]:
-        context.preferences.active_section = "ADDONS"
-        bpy.ops.screen.userpref_show("INVOKE_DEFAULT")
+        try:
+            # Opens Preferences filtered to, and expanded on, this add-on.
+            bpy.ops.preferences.addon_show(module=_ADDON_ID)
+        except (AttributeError, RuntimeError, TypeError):
+            context.preferences.active_section = "ADDONS"
+            bpy.ops.screen.userpref_show("INVOKE_DEFAULT")
+        return {"FINISHED"}
+
+
+class KZ_OT_show_scan_issues(bpy.types.Operator):
+    """List the candidates the last scan skipped and why"""
+
+    bl_idname = "kz.show_scan_issues"
+    bl_label = "Show Skipped Candidates"
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        catalog = _safe_current_catalog(context)
+        return catalog is not None and bool(catalog.issues)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        catalog = _current_catalog(context)
+        if catalog is None or not catalog.issues:
+            return {"CANCELLED"}
+        issues = catalog.issues
+        for issue in issues:
+            print(f"Killzone scan skipped {issue.path}: {issue.message}")
+        listed = issues[:_MAX_LISTED_SCAN_ISSUES]
+
+        def draw(menu: bpy.types.UIPopupMenu, _context: object) -> None:
+            for issue in listed:
+                menu.layout.label(
+                    text=f"{Path(issue.path).name}: {issue.message}",
+                    icon="ERROR",
+                )
+            if len(issues) > len(listed):
+                menu.layout.label(
+                    text=(
+                        f"... and {len(issues) - len(listed)} more; "
+                        "see the system console"
+                    )
+                )
+
+        context.window_manager.popup_menu(
+            draw,
+            title=f"{len(issues)} skipped candidate(s)",
+            icon="ERROR",
+        )
         return {"FINISHED"}
 
 
@@ -700,8 +826,11 @@ class KZ_OT_set_animation_clip_selection(bpy.types.Operator):
     selected: BoolProperty(name="Selected", default=True)
 
     def execute(self, context: bpy.types.Context) -> set[str]:
-        for clip in context.scene.kz_animation_clips:
-            clip.selected = self.selected
+        clips = context.scene.kz_animation_clips
+        clips.foreach_set(
+            "selected",
+            np.full(len(clips), self.selected, dtype=bool),
+        )
         state = "Selected" if self.selected else "Cleared"
         self.report(
             {"INFO"},
@@ -1068,12 +1197,79 @@ class KZ_OT_import_model(bpy.types.Operator):
         return {"FINISHED"}
 
 
-class KZ_PT_tools(bpy.types.Panel):
-    bl_label = "Killzone Asset Tools"
-    bl_idname = "KZ_PT_asset_tools"
+class KZ_OT_import_texture(bpy.types.Operator):
+    """Import the selected standalone native texture as a packed Image"""
+
+    bl_idname = "kz.import_texture"
+    bl_label = "Import Texture"
+    bl_options = {"REGISTER", "UNDO"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        catalog = _safe_current_catalog(context)
+        return catalog is not None and bool(catalog.textures)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        return _run_import_with_rollback(self, context, self._import)
+
+    def _import(self, context: bpy.types.Context) -> set[str]:
+        try:
+            catalog = _current_catalog(context)
+            if catalog is None:
+                raise CoreFormatError(
+                    "Scan the configured ISO before importing"
+                )
+            asset = _selected_texture(context)
+            image = import_native_texture(catalog.source_path, asset.path)
+        except (KZAssetError, ValueError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        shown = _show_image_in_editors(context, image)
+        self.report(
+            {"INFO"},
+            f"Imported {asset.display_name} as Image {image.name!r} "
+            f"({image.size[0]}x{image.size[1]})"
+            + ("" if shown else "; open it in an Image Editor to view"),
+        )
+        return {"FINISHED"}
+
+
+def _show_image_in_editors(
+    context: bpy.types.Context,
+    image: bpy.types.Image,
+) -> bool:
+    screen = getattr(context, "screen", None)
+    if screen is None:
+        return False
+    shown = False
+    for area in screen.areas:
+        if area.type != "IMAGE_EDITOR":
+            continue
+        for space in area.spaces:
+            if space.type == "IMAGE_EDITOR":
+                space.image = image
+                shown = True
+        area.tag_redraw()
+    return shown
+
+
+class _KZ_SidebarPanel:
     bl_space_type = "VIEW_3D"
     bl_region_type = "UI"
     bl_category = "KZ Tools"
+
+
+class _KZ_CatalogSubPanel(_KZ_SidebarPanel):
+    bl_parent_id = "KZ_PT_asset_tools"
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return _safe_current_catalog(context) is not None
+
+
+class KZ_PT_tools(_KZ_SidebarPanel, bpy.types.Panel):
+    bl_label = "Killzone Asset Tools"
+    bl_idname = "KZ_PT_asset_tools"
 
     def draw(self, context: bpy.types.Context) -> None:
         layout = self.layout
@@ -1095,7 +1291,11 @@ class KZ_PT_tools(bpy.types.Panel):
         if not source_matches:
             box = layout.box()
             box.label(
-                text="Configure the ISO and scan assets once.",
+                text=(
+                    "The source changed after scanning. Rescan it."
+                    if catalog is not None
+                    else "Configure the ISO and scan assets once."
+                ),
                 icon="INFO",
             )
             box.operator(
@@ -1115,8 +1315,16 @@ class KZ_PT_tools(bpy.types.Panel):
             icon="PREFERENCES",
         )
 
-        material_box = layout.box()
-        material_box.label(text="Material Preview", icon="MATERIAL")
+
+class KZ_PT_material_preview(_KZ_CatalogSubPanel, bpy.types.Panel):
+    bl_label = "Material Preview"
+    bl_idname = "KZ_PT_material_preview"
+
+    def draw_header(self, context: bpy.types.Context) -> None:
+        self.layout.label(icon="MATERIAL")
+
+    def draw(self, context: bpy.types.Context) -> None:
+        material_box = self.layout.column()
         material_box.prop(context.scene, "kz_use_standard_view_transform")
         material_box.prop(context.scene, "kz_material_artist_lightmaps")
         material_box.prop(context.scene, "kz_material_artist_fallback")
@@ -1129,8 +1337,19 @@ class KZ_PT_tools(bpy.types.Panel):
                 icon="INFO",
             )
 
-        map_box = layout.box()
-        map_box.label(text="Import Map", icon="WORLD_DATA")
+
+class KZ_PT_import_map(_KZ_CatalogSubPanel, bpy.types.Panel):
+    bl_label = "Import Map"
+    bl_idname = "KZ_PT_import_map"
+
+    def draw_header(self, context: bpy.types.Context) -> None:
+        self.layout.label(icon="WORLD_DATA")
+
+    def draw(self, context: bpy.types.Context) -> None:
+        catalog = _safe_current_catalog(context)
+        if catalog is None:
+            return
+        map_box = self.layout.column()
         if catalog.maps:
             map_box.prop(context.scene, "kz_map_asset", text="Map")
             map_box.label(
@@ -1150,8 +1369,20 @@ class KZ_PT_tools(bpy.types.Panel):
         else:
             map_box.label(text="No importable maps were cached")
 
-        model_box = layout.box()
-        model_box.label(text="Import Model", icon="MESH_DATA")
+
+class KZ_PT_import_model(_KZ_CatalogSubPanel, bpy.types.Panel):
+    bl_label = "Import Model"
+    bl_idname = "KZ_PT_import_model"
+
+    def draw_header(self, context: bpy.types.Context) -> None:
+        self.layout.label(icon="MESH_DATA")
+
+    def draw(self, context: bpy.types.Context) -> None:
+        catalog = _safe_current_catalog(context)
+        if catalog is None:
+            return
+        layout = self.layout
+        model_box = layout.column()
         if catalog.models:
             model_box.prop(context.scene, "kz_model_asset", text="Model")
             try:
@@ -1217,8 +1448,10 @@ class KZ_PT_tools(bpy.types.Panel):
                         )
                         clips = context.scene.kz_animation_clips
                         if clips:
-                            selected_count = sum(
-                                clip.selected for clip in clips
+                            selected_flags = np.zeros(len(clips), dtype=bool)
+                            clips.foreach_get("selected", selected_flags)
+                            selected_count = int(
+                                np.count_nonzero(selected_flags)
                             )
                             model_box.label(
                                 text=(
@@ -1270,17 +1503,49 @@ class KZ_PT_tools(bpy.types.Panel):
             model_box.label(text="No importable models were cached")
 
 
+
+
+class KZ_PT_import_texture(_KZ_CatalogSubPanel, bpy.types.Panel):
+    bl_label = "Import Texture"
+    bl_idname = "KZ_PT_import_texture"
+    bl_options = {"DEFAULT_CLOSED"}
+
+    def draw_header(self, context: bpy.types.Context) -> None:
+        self.layout.label(icon="IMAGE_DATA")
+
+    def draw(self, context: bpy.types.Context) -> None:
+        catalog = _safe_current_catalog(context)
+        if catalog is None:
+            return
+        column = self.layout.column()
+        if catalog.textures:
+            column.prop(context.scene, "kz_texture_asset", text="Texture")
+            column.label(
+                text="Creates a packed Image with a fake user",
+                icon="INFO",
+            )
+            column.operator(KZ_OT_import_texture.bl_idname, icon="IMPORT")
+        else:
+            column.label(text="No standalone textures were cached")
+
+
 _CLASSES = (
     KZ_PG_animation_clip,
     KZ_UL_animation_clips,
     KZ_AddonPreferences,
     KZ_OT_scan_assets,
     KZ_OT_open_preferences,
+    KZ_OT_show_scan_issues,
     KZ_OT_select_animation_bank,
     KZ_OT_set_animation_clip_selection,
     KZ_OT_import_map,
     KZ_OT_import_model,
+    KZ_OT_import_texture,
     KZ_PT_tools,
+    KZ_PT_material_preview,
+    KZ_PT_import_map,
+    KZ_PT_import_model,
+    KZ_PT_import_texture,
 )
 
 
@@ -1310,6 +1575,11 @@ def register() -> None:
         description="Cached static or skinned native model to import",
         items=_model_items,
         update=_refresh_animation_clips,
+    )
+    bpy.types.Scene.kz_texture_asset = EnumProperty(
+        name="Texture",
+        description="Cached standalone native texture to import",
+        items=_texture_items,
     )
     bpy.types.Scene.kz_import_model_animations = BoolProperty(
         name="Import Animations",
@@ -1384,6 +1654,7 @@ def unregister() -> None:
     del bpy.types.Scene.kz_animation_clips
     del bpy.types.Scene.kz_additional_animation_bank
     del bpy.types.Scene.kz_import_model_animations
+    del bpy.types.Scene.kz_texture_asset
     del bpy.types.Scene.kz_model_asset
     del bpy.types.Scene.kz_import_map_textures
     del bpy.types.Scene.kz_map_asset

@@ -56,6 +56,11 @@ from io_scene_killzone.core.native_skinned_model import (
     NativeSkinnedResourceNode,
 )
 from io_scene_killzone.core.native_static_model import NativeStaticModel
+from io_scene_killzone.core.native_asset_catalog import (
+    NativeAssetCatalog,
+    NativeCachedModel,
+    NativeCachedTexture,
+)
 from io_scene_killzone.core.native_texture import parse_native_texture
 from io_scene_killzone.native_level_io import (
     _configure_texture_node,
@@ -798,6 +803,140 @@ def _check_failed_import_rollback() -> None:
         finished_import,
     ) == {"FINISHED"}
     assert "Rollback Kept Mesh" in bpy.data.meshes
+
+
+def _check_native_v4_8_colors_are_exact() -> None:
+    from io_scene_killzone.native_blender_data import build_native_mesh
+
+    colors = ((1, 64, 128, 255), (217, 3, 0, 128), None)
+    mesh, _, _ = build_native_mesh(
+        "V4-8 Exactness",
+        positions=((0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+        normals=((0.0, 0.0, 1.0),) * 3,
+        triangles=((0, 1, 2),),
+        material_ids=(0,),
+        materials_by_token={},
+        fallback_material=bpy.data.materials.new("V4-8 Exactness"),
+        coordinates=((), (), ()),
+        colors=colors,
+    )
+    attribute = mesh.color_attributes["Native V4-8"]
+    assert attribute.data_type == "FLOAT_COLOR"
+    values = [0.0] * (len(colors) * 4)
+    attribute.data.foreach_get("color", values)
+    expected = [
+        component
+        for color in colors
+        for component in (color or (128, 128, 128, 128))
+    ]
+    assert all(
+        abs(value * 255.0 - byte) < 1.0e-4
+        for value, byte in zip(values, expected)
+    ), values
+
+
+def _check_catalog_ui_helpers() -> None:
+    catalog = NativeAssetCatalog(
+        source_path="/synthetic/source",
+        source_type="directory",
+        container_sizes=(1, 1, 1, 1, 1),
+        maps=(),
+        textures=(
+            NativeCachedTexture(
+                path="lumps/texture.fixture.core",
+                display_name="fixture_texture",
+                texture_name="fixture_texture",
+                size=4,
+            ),
+        ),
+        models=(
+            NativeCachedModel(
+                path="lumps/entity.fixture.core",
+                corestream_path="lumps/entity.fixture.corestream",
+                display_name="Fixture (Skinned)",
+                kind="skinned",
+                root_token=0x1234,
+                root_section_offset=0,
+                root_object_index=0,
+                # Clips without an admitted bank used to abort the scan.
+                own_animation_count=3,
+            ),
+        ),
+        animation_banks=(),
+        issues=(),
+    )
+    raw = catalog.to_json()
+    preferences = SimpleNamespace(
+        asset_cache_json=raw,
+        asset_cache_digest=native_operators._catalog_digest(raw),
+    )
+    native_operators._invalidate_runtime_cache()
+    parsed = native_operators._catalog_from_preferences(preferences)
+    assert parsed == catalog
+    # A matching digest must answer without reading the JSON again.
+    preferences.asset_cache_json = "not json"
+    assert native_operators._catalog_from_preferences(preferences) is parsed
+    # A legacy cache without a digest still parses (and detects changes).
+    native_operators._invalidate_runtime_cache()
+    legacy = SimpleNamespace(asset_cache_json=raw, asset_cache_digest="")
+    assert native_operators._catalog_from_preferences(legacy) == catalog
+
+    # Empty placeholders are shared constants and are never cached.
+    native_operators._enum_items.clear()
+    placeholder = native_operators._cached_items(
+        "maps", (), str, str
+    )
+    assert placeholder is native_operators._EMPTY_ASSET_ITEMS
+    assert "maps" not in native_operators._enum_items
+
+    original_current = native_operators._current_catalog
+    original_import = native_operators.import_native_texture
+    imported: list[tuple[str, str]] = []
+
+    def fake_import(source_path: str, asset_path: str) -> bpy.types.Image:
+        imported.append((source_path, asset_path))
+        return bpy.data.images.new("KZ Fixture Texture", 4, 2)
+
+    native_operators._current_catalog = lambda context: catalog
+    native_operators.import_native_texture = fake_import
+    try:
+        native_operators._reset_scene_selections(catalog)
+        scene = bpy.context.scene
+        assert scene.kz_texture_asset == "0"
+        assert len(scene.kz_animation_clips) == 0
+        reports: list[tuple[set[str], str]] = []
+        operator = SimpleNamespace(
+            report=lambda kind, message: reports.append((kind, message))
+        )
+        status = native_operators.KZ_OT_import_texture._import(
+            operator,
+            bpy.context,
+        )
+        assert status == {"FINISHED"}, reports
+        assert imported == [
+            ("/synthetic/source", "lumps/texture.fixture.core")
+        ]
+        assert "4x2" in reports[-1][1]
+    finally:
+        native_operators._current_catalog = original_current
+        native_operators.import_native_texture = original_import
+        native_operators._invalidate_runtime_cache()
+
+    for name in (
+        "import_texture",
+        "show_scan_issues",
+        "import_map",
+        "import_model",
+    ):
+        assert hasattr(bpy.ops.kz, name), name
+    for panel in (
+        "KZ_PT_asset_tools",
+        "KZ_PT_material_preview",
+        "KZ_PT_import_map",
+        "KZ_PT_import_model",
+        "KZ_PT_import_texture",
+    ):
+        assert hasattr(bpy.types, panel), panel
 
 
 def run() -> None:
@@ -2523,6 +2662,8 @@ def run() -> None:
         _check_packed_level_images_and_reuse()
         _check_artist_material_modes()
         _check_failed_import_rollback()
+        _check_native_v4_8_colors_are_exact()
+        _check_catalog_ui_helpers()
 
         scene = bpy.context.scene
         assert scene.kz_use_standard_view_transform is True

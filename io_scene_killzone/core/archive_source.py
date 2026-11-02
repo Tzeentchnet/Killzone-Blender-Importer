@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import struct
+from typing import BinaryIO
 
 from .errors import CatalogFormatError
 from .iso9660 import Iso9660Image, IsoRecord
@@ -41,6 +42,9 @@ class KillzoneArchiveSource:
         self.source_type = ""
         self._iso: Iso9660Image | None = None
         self._containers: dict[int, _ContainerLocation] = {}
+        # Directory containers stay open for the source's lifetime; a scan
+        # reads thousands of small ranges and reopening each one is slow.
+        self._streams: dict[int, BinaryIO] = {}
         self._catalog: KillzoneCatalog | None = None
         self._open = False
 
@@ -66,6 +70,7 @@ class KillzoneArchiveSource:
             if self._iso is not None:
                 self._iso.__exit__(None, None, None)
                 self._iso = None
+            self._close_streams()
             self._containers.clear()
             raise
         self._open = True
@@ -75,9 +80,34 @@ class KillzoneArchiveSource:
         if self._iso is not None:
             self._iso.__exit__(exc_type, exc, traceback)
             self._iso = None
+        self._close_streams()
         self._containers.clear()
         self._catalog = None
         self._open = False
+
+    def _close_streams(self) -> None:
+        streams = tuple(self._streams.values())
+        self._streams.clear()
+        for stream in streams:
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def _directory_stream(
+        self,
+        package_index: int,
+        location: _ContainerLocation,
+    ) -> BinaryIO:
+        stream = self._streams.get(package_index)
+        if stream is None:
+            if location.path is None:
+                raise CatalogFormatError(
+                    "Directory archive source is unavailable"
+                )
+            stream = location.path.open("rb")
+            self._streams[package_index] = stream
+        return stream
 
     def _open_iso(self, path: Path) -> None:
         image = Iso9660Image(path)
@@ -194,12 +224,10 @@ class KillzoneArchiveSource:
             return self._iso.read_file_range(
                 location.iso_record, offset, size
             )
-        if location.path is None:
-            raise CatalogFormatError("Directory archive source is unavailable")
         try:
-            with location.path.open("rb") as stream:
-                stream.seek(offset)
-                data = stream.read(size)
+            stream = self._directory_stream(package_index, location)
+            stream.seek(offset)
+            data = stream.read(size)
         except OSError as exc:
             raise CatalogFormatError(
                 f"Unable to read {location.info.name}"

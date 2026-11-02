@@ -470,8 +470,11 @@ Those objects select texture frames; coordinate animation remains unproved.
 
 Static opcode `0x6E` and the equivalent skinned stream provide unsigned RGBA
 bytes. Attribute bit `0x10` in the static mesh record predicts the stream.
-The importer stores it as POINT-domain `BYTE_COLOR` named `Native V4-8`;
-vertices without a stream receive diagnostic `(128,128,128,128)`.
+The importer stores it as POINT-domain `FLOAT_COLOR` named `Native V4-8`
+holding `byte / 255`; vertices without a stream receive diagnostic
+`(128,128,128,128)`. A `BYTE_COLOR` attribute is not used because Blender
+stores those bytes sRGB-encoded, so linear `byte / 255` values written through
+it round-trip with up to one byte of error (`128` reads back as `128.24`).
 
 The verified cubic-diffuse VU path uses squared normal components and six
 signed-axis light coefficients, then computes:

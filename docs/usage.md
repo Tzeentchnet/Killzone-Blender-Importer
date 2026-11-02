@@ -24,6 +24,17 @@ Configure native assets once:
    animation-bank catalog is cached in the add-on preferences and reused
    across Blender files.
 3. Open **3D View > Sidebar > KZ Tools** to import from the cached selectors.
+   The sidebar is split into collapsible **Material Preview**, **Import Map**,
+   **Import Model**, and **Import Texture** sub-panels.
+
+The scan reports its progress on the mouse cursor. If any candidates were
+skipped, **Show Skipped Candidates** in the add-on preferences lists each path
+and reason (the full list is also printed to the system console). The cache is
+stored in the add-on preferences, so if preferences auto-save is disabled, use
+**Save Preferences** to keep it across Blender sessions.
+
+**Import Texture** imports one of the cached standalone variant-1 textures as
+a packed Image with a fake user, and shows it in any open Image Editor.
 
 **Import Map** lists campaign maps by retail chapter and area, followed by
 multiplayer maps, using numeric rather than lexical level ordering. **Import
